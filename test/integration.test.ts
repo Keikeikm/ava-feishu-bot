@@ -12,9 +12,21 @@ import { Sessions } from '../src/sessions.js';
 import { loadConfig } from '../src/config.js';
 import { avaSource } from '../src/sources.js';
 import type { Messenger } from '../src/feishu.js';
-import type { AnalysisOutput, DatasetInfo, MessageEvent } from '../src/types.js';
+import type { AnalysisOutput, DatasetInfo, DatasetSource, MessageEvent } from '../src/types.js';
+
+async function waitFor(check: () => boolean) {
+  const deadline = Date.now() + 20000;
+  while (!check()) { if (Date.now() > deadline) throw new Error('Timed out waiting for reply'); await new Promise(resolve => setTimeout(resolve, 10)); }
+}
 
 const grouped = 'SELECT "地区", SUM("销售额") AS "总销售额" FROM data GROUP BY "地区" ORDER BY "总销售额" DESC';
+const overview = `
+  SELECT 'line' AS chart_kind, '月度销售额' AS chart_title, "月份" AS chart_label, SUM("销售额") AS chart_value
+  FROM data GROUP BY "月份"
+  UNION ALL
+  SELECT 'bar', '各地区利润率（%）', "地区", 100.0 * SUM("利润") / SUM("销售额")
+  FROM data GROUP BY "地区"
+  ORDER BY chart_title, chart_label DESC`;
 function event(id: string, text: string, user = 'ou_user'): MessageEvent {
   return { sender: { sender_type: 'user', sender_id: { open_id: user } }, message: { message_id: id, chat_id: 'oc_chat', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }) } };
 }
@@ -31,9 +43,10 @@ test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图�
     prompts.push(prompt);
     let content: string;
     if (prompt.includes('Generate ONLY the SQL')) {
-      content = /当前问题：只看华东/.test(prompt) ? 'SELECT SUM("销售额") AS "总销售额" FROM data WHERE "地区" = \'华东\'' : grouped;
+      content = /当前问题：只看华东/.test(prompt) ? 'SELECT SUM("销售额") AS "总销售额" FROM data WHERE "地区" = \'华东\''
+        : /当前问题：分析一下\n/.test(prompt) && prompt.includes('chart_value') ? overview : grouped;
     } else if (prompt.includes('queryExplanation')) {
-      content = JSON.stringify({ queryExplanation: '按地区求和', conclusion: '华东销售额为 45000。' });
+      content = /当前问题：比较地区销售额\n/.test(prompt) ? 'invalid JSON' : JSON.stringify({ queryExplanation: '按地区求和', conclusion: '华东销售额为 45000。' });
     } else if (prompt.includes('图表推荐专家')) content = 'column';
     else if (prompt.includes('GPT-Vis 可视化专家')) {
       content = breakChart ? 'invalid JSON' : JSON.stringify({ type: 'column', data: [{ category: '华东', value: 45000 }, { category: '华南', value: 20000 }, { category: '华北', value: 11000 }] });
@@ -46,7 +59,17 @@ test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图�
   const port = (server.address() as { port: number }).port;
   const config = loadConfig({ FEISHU_APP_ID: 'test', FEISHU_APP_SECRET: 'test', LLM_API_KEY: 'test', LLM_MODEL: 'test', LLM_BASE_URL: `http://127.0.0.1:${port}/v1`, ENABLE_CHARTS: 'true' });
   const runtime = await mkdtemp(join(tmpdir(), 'ava-e2e-'));
-  const sessions = new Sessions(config);
+  const bitableImports: string[] = [];
+  const sessions = new class extends Sessions {
+    override async replace(key: string, source: DatasetSource, directory: string) {
+      if (source.kind !== 'bitable') return super.replace(key, source, directory);
+      // Substitute a local snapshot for the private Feishu API while keeping the real AVA analysis flow.
+      bitableImports.push(source.url);
+      const path = join(directory, 'bitable-snapshot.csv');
+      await copyFile(resolve('examples/sales.csv'), path);
+      return super.replace(key, { kind: 'file', path, name: '多维表格.csv' }, directory);
+    }
+  }(config);
   const sent: { id: string; kind: string; data: unknown }[] = [];
   const messenger: Messenger = {
     text: async (m, text) => { sent.push({ id: m.id, kind: 'text', data: text }); },
@@ -61,34 +84,83 @@ test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图�
     upload.message.message_type = 'file';
     upload.message.content = JSON.stringify({ file_key: 'file_test', file_name: 'sales.csv' });
     bot.accept(upload);
+    await waitFor(() => sent.some(s => s.id === 'upload' && s.kind === 'card'));
     const question = event('question', '按地区汇总销售额并画柱状图');
     bot.accept(question); bot.accept(question);
+    bot.accept(event('report1', '/导出 JSON'));
+    bot.accept(event('csv1', '/导出 CSV'));
+    bot.accept(event('chart1', '/导出 图表'));
+    await waitFor(() => sent.some(s => s.id === 'chart1' && s.kind === 'analysis-chart.html'));
     bot.accept(event('followup', '只看华东'));
+    bot.accept(event('followup-export', '/导出 JSON'));
+    bot.accept(event('no-chart', '/分析 不画图 按地区汇总销售额'));
     bot.accept(event('other-user', '汇总销售额', 'ou_user2'));
     const mixed = event('mixed', '');
     mixed.message.message_type = 'post';
-    mixed.message.content = JSON.stringify({ content: [[{ tag: 'text', text: '按地区汇总销售额并画柱状图' }]], files: [{ file_key: 'file_mixed', file_name: 'sales.csv' }] });
+    mixed.message.content = JSON.stringify({ content: [[{ tag: 'text', text: '分析一下' }]], files: [{ file_key: 'file_mixed', file_name: 'sales.csv' }] });
     bot.accept(mixed);
+    bot.accept(event('mixed-export', '/导出 JSON'));
+    await waitFor(() => sent.some(s => s.id === 'mixed-export' && s.kind === 'analysis-report.json'));
+    bot.accept(event('summary-failure', '比较地区销售额'));
+    const shared = event('bitable-with-question', '', 'ou_user2');
+    shared.message.message_type = 'post';
+    shared.message.content = JSON.stringify({ content: [[
+      { tag: 'a', text: 'Untitled', href: 'https://demo.feishu.cn/base/ABC?table=tbl123&view=vew123' },
+      { tag: 'text', text: '分析一下' },
+    ]] });
+    bot.accept(shared);
     await bot.close();
+    assert.deepEqual(bitableImports, ['https://demo.feishu.cn/base/ABC?table=tbl123']);
+    const bitableReplies = sent.filter(s => s.id === shared.message.message_id);
+    assert.deepEqual(bitableReplies.map(s => s.kind), ['text', 'card']);
+    assert.match(JSON.stringify(bitableReplies[1]?.data), /"tag":"chart"/);
     assert.ok(sent.some(s => s.id === 'hello' && s.kind === 'card'));
     assert.ok(!sent.some(s => s.id === 'hello' && typeof s.data === 'string' && s.data.includes('错误编号')));
-    const report = sent.find(s => s.id === 'question' && s.kind === 'analysis-report.json');
+    const report = sent.find(s => s.id === 'report1' && s.kind === 'analysis-report.json');
     assert.ok(report, JSON.stringify(sent));
     const parsed = JSON.parse(report.data as string);
     assert.deepEqual(parsed.data, [{ 地区: '华东', 总销售额: 45000 }, { 地区: '华南', 总销售额: 20000 }, { 地区: '华北', 总销售额: 11000 }]);
-    assert.equal(parsed.sql, grouped);
-    assert.equal(sent.filter(s => s.id === 'question' && s.kind === 'analysis-report.json').length, 1);
-    const csv = sent.find(s => s.id === 'question' && s.kind === 'analysis-result.csv');
+    assert.equal(parsed.sql, undefined);
+    const answer = sent.find(s => s.id === 'question' && s.kind === 'card');
+    assert.ok(answer);
+    assert.ok(!JSON.stringify(answer.data).includes('结果预览'));
+    assert.ok(!JSON.stringify(answer.data).includes('计算 SQL'));
+    assert.ok(!JSON.stringify(answer.data).includes('SELECT'));
+    const regionalCard = answer.data as { schema: string; body: { elements: { tag: string; chart_spec?: { type: string; data: { values: unknown[] } } }[] } };
+    assert.equal(regionalCard.schema, '2.0');
+    const regionalChart = regionalCard.body.elements.find(e => e.tag === 'chart')?.chart_spec;
+    assert.equal(regionalChart?.type, 'bar');
+    assert.deepEqual(regionalChart?.data.values, [{ label: '华东', value: 45000 }, { label: '华南', value: 20000 }, { label: '华北', value: 11000 }]);
+    const recovered = sent.find(s => s.id === 'summary-failure' && s.kind === 'card');
+    assert.ok(recovered);
+    assert.match(JSON.stringify(recovered.data), /最高为 华东（45,000）/);
+    assert.equal((recovered.data as typeof regionalCard).body.elements.filter(e => e.tag === 'chart').length, 1);
+    for (const id of ['followup', 'no-chart']) {
+      const reply = sent.find(s => s.id === id && s.kind === 'card');
+      assert.ok(reply);
+      assert.doesNotMatch(JSON.stringify(reply.data), /"tag":"chart"/);
+    }
+    assert.equal(sent.filter(s => ['question', 'followup', 'mixed', 'no-chart'].includes(s.id) && /\.(json|csv|html)$/.test(s.kind)).length, 0);
+    assert.equal(sent.filter(s => s.id === 'mixed' && s.kind === 'card').length, 1);
+    assert.equal(sent.filter(s => s.id === 'report1' && s.kind === 'analysis-report.json').length, 1);
+    const csv = sent.find(s => s.id === 'csv1' && s.kind === 'analysis-result.csv');
     assert.match(csv?.data as string, /45000/);
-    const chart = sent.find(s => s.id === 'question' && s.kind === 'analysis-chart.html');
+    const chart = sent.find(s => s.id === 'chart1' && s.kind === 'analysis-chart.html');
     assert.match(chart?.data as string, /GPTVis/);
-    const followup = JSON.parse(sent.find(s => s.id === 'followup' && s.kind === 'analysis-report.json')!.data as string);
+    const followup = JSON.parse(sent.find(s => s.id === 'followup-export' && s.kind === 'analysis-report.json')!.data as string);
     assert.deepEqual(followup.data, [{ 总销售额: 45000 }]);
     assert.ok(prompts.some(p => p.includes('历史问题与查询')));
     assert.ok(sent.some(s => s.id === 'other-user' && typeof s.data === 'string' && s.data.includes('请先发送表格')));
-    const mixedReport = sent.find(s => s.id === 'mixed' && s.kind === 'analysis-report.json');
+    const mixedReport = sent.find(s => s.id === 'mixed-export' && s.kind === 'analysis-report.json');
     assert.ok(mixedReport, JSON.stringify(sent));
-    assert.equal(JSON.parse(mixedReport.data as string).data[0].总销售额, 45000);
+    const overviewCard = sent.find(s => s.id === 'mixed' && s.kind === 'card')!.data as typeof regionalCard;
+    const overviewCharts = overviewCard.body.elements.flatMap(e => e.chart_spec ? [e.chart_spec] : []);
+    assert.equal(overviewCharts.length, 2);
+    assert.deepEqual(overviewCharts.find(c => c.type === 'line')?.data.values, [{ label: '2026-01', value: 35000 }, { label: '2026-02', value: 41000 }]);
+    const margins = overviewCharts.find(c => c.type === 'bar')?.data.values as { label: string; value: number }[];
+    assert.deepEqual(Object.fromEntries(margins.map(p => [p.label, p.value])), { 华东: 20, 华南: 15, 华北: 10 });
+    assert.equal(JSON.parse(mixedReport.data as string).query, '分析一下');
+    assert.ok(prompts.some(p => p.includes('当前问题：分析一下') && p.includes('整体判断')));
 
     // A visualization error must not discard a completed analysis.
     const engine = new EngineClient({ kind: 'file', path: resolve('examples/sales.csv'), name: 'sales.csv' }, config);

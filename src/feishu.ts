@@ -8,6 +8,7 @@ import type { Card } from './cards.js';
 import type { Config } from './config.js';
 import type { IncomingMessage } from './types.js';
 import { UserError } from './errors.js';
+import { elapsedMs, logEvent } from './logging.js';
 
 function permissionScopes(body: unknown): string[] {
   if (!body || typeof body !== 'object') return [];
@@ -107,6 +108,7 @@ export function createFeishu(config: Config, transport?: lark.HttpInstance): { m
   const sends = new Map<string, Promise<void>>();
   const lastSent = new Map<string, number>();
   async function reply(message: IncomingMessage, type: string, content: object): Promise<void> {
+    const startedAt = performance.now();
     const serialized = JSON.stringify(content);
     const previous = sends.get(message.chatId) || Promise.resolve();
     const next = previous.catch(() => {}).then(async () => {
@@ -120,7 +122,13 @@ export function createFeishu(config: Config, transport?: lark.HttpInstance): { m
       if (result.code !== 0) throw new UserError(`飞书消息发送失败（错误码 ${result.code ?? '未知'}），请检查机器人发言权限。`, 'FEISHU_SEND');
     });
     sends.set(message.chatId, next);
-    try { await next; } finally {
+    try {
+      await next;
+      logEvent('reply_sent', { reply_type: type, duration_ms: elapsedMs(startedAt) });
+    } catch (error) {
+      logEvent('reply_failed', { reply_type: type, duration_ms: elapsedMs(startedAt) }, 'warn');
+      throw error;
+    } finally {
       if (sends.get(message.chatId) === next) sends.delete(message.chatId);
       // Bound the idle chat timestamp cache.
       if (lastSent.size > 1000) for (const [key, at] of lastSent) if (Date.now() - at > 60_000) lastSent.delete(key);
@@ -137,6 +145,8 @@ export function createFeishu(config: Config, transport?: lark.HttpInstance): { m
     },
     download: async (message, destination) => {
       if (!message.file) throw new UserError('没有找到消息中的文件。');
+      const startedAt = performance.now();
+      logEvent('file_download_started', { file_name: message.file.name });
       try {
         const resource = await client.im.messageResource.get({ path: { message_id: message.id, file_key: message.file.key }, params: { type: 'file' } });
         const stream = resource.getReadableStream();
@@ -152,7 +162,7 @@ export function createFeishu(config: Config, transport?: lark.HttpInstance): { m
           try { body = JSON.parse(await readFile(destination, 'utf8')); } catch { /* valid downloaded data need not be JSON */ }
           if (body && typeof body.code === 'number' && body.code >= 10_000 && typeof body.msg === 'string') throw downloadError(body.code, undefined, undefined, body);
         }
-        console.info(JSON.stringify({ event: 'file_downloaded', bytes: size }));
+        logEvent('file_downloaded', { file_name: message.file.name, bytes: size, duration_ms: elapsedMs(startedAt) });
       } catch (error) {
         throw await fileDownloadFailure(error);
       }

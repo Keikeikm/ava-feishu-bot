@@ -3,6 +3,7 @@ import type { Config } from './config.js';
 import type { DatasetInfo, DatasetSource } from './types.js';
 import { EngineClient } from './engine.js';
 import { UserError } from './errors.js';
+import { logEvent, requestLogContext } from './logging.js';
 
 interface Session {
   engine: EngineClient;
@@ -32,6 +33,9 @@ export class Sessions {
       const info = await engine.request<DatasetInfo>('load');
       const previous = this.entries.get(key);
       this.entries.set(key, { engine, info, directory, touched: Date.now(), busy: 0 });
+      if (requestLogContext.getStore()) {
+        logEvent('dataset_activated', { file_name: info.name, previous_file_name: previous?.info.name, tables: info.schema.models.length });
+      }
       if (previous) await this.destroy(previous).catch(() => console.error('旧数据清理失败。'));
       return info;
     } catch (error) {
@@ -48,8 +52,8 @@ export class Sessions {
     session.busy++;
     try {
       if (command === 'analyze') {
-        const options = payload as { query: string; charts: boolean };
-        return await session.engine.analyze(options.query, options.charts) as T;
+        const options = payload as { query: string; inlineCharts: boolean };
+        return await session.engine.analyze(options.query, { inlineCharts: options.inlineCharts }) as T;
       }
       return await session.engine.request<T>(command, payload);
     }

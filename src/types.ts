@@ -1,4 +1,5 @@
 import type { AnalysisResponse, Profile, Schema, VisualizeResponse } from '@antv/ava';
+import type { InlineChart } from './charts.js';
 
 export type DatasetSource =
   | { kind: 'file'; path: string; name: string }
@@ -14,6 +15,7 @@ export interface DatasetInfo {
 export interface AnalysisOutput {
   result: AnalysisResponse;
   visualization: VisualizeResponse | null;
+  charts?: InlineChart[];
   chartWarning?: string;
 }
 

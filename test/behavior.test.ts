@@ -9,8 +9,25 @@ import { Deduplicator, normalizeMessage } from '../src/messages.js';
 import { JobQueue } from '../src/queue.js';
 import { resultCsv } from '../src/cards.js';
 import { writeBoundedFile } from '../src/feishu.js';
-import { bitableUrl } from '../src/sources.js';
+import { bitableRequest, bitableUrl } from '../src/sources.js';
 import type { MessageEvent } from '../src/types.js';
+import { analysisPrompt } from '../src/analysis-prompt.js';
+import { resultCard } from '../src/cards.js';
+import type { DatasetInfo } from '../src/types.js';
+
+test('宽泛分析主动生成聚合分析目标，结论卡不展示明细、SQL 或附件清单', () => {
+  const info = { profile: { models: [] } } as unknown as DatasetInfo;
+  const prompt = analysisPrompt('分析一下', info);
+  assert.match(prompt, /整体判断/);
+  assert.match(prompt, /变化率/);
+  assert.match(prompt, /总利润\/总收入/);
+  const specific = analysisPrompt('分析一下华东销售下降的原因', info);
+  assert.match(specific, /聚焦用户当前问题/);
+  const card = resultCard({ result: { query: '分析一下', text: '【结论】销售增长集中在华东。\n【关键依据】销售额增长17.1%。\n【下一步】要比较各地区的增长贡献吗？', data: [{ private: 'RAW_DATA' }], schema: [], sql: 'SELECT secret FROM data' }, visualization: null });
+  const rendered = JSON.stringify(card);
+  assert.match(rendered, /销售增长集中在华东/);
+  assert.ok(!/RAW_DATA|SELECT|结果预览|报告 JSON/.test(rendered));
+});
 
 export function config() { return loadConfig({ FEISHU_APP_ID: 'test-app', FEISHU_APP_SECRET: 'test-secret', LLM_MODEL: 'test-model', LLM_API_KEY: 'test-key', ENABLE_CHARTS: 'false' }); }
 export function message(id: string, text: string, user = 'ou_user'): MessageEvent {
@@ -42,8 +59,19 @@ test('群聊文件无需 @，路径不能从上传名称穿越，富文本链接
   const post = message('post', '');
   post.message.message_type = 'post';
   post.message.content = JSON.stringify({ title: '', content: [[{ tag: 'text', text: '/导入 ' }, { tag: 'a', href: 'https://demo.feishu.cn/base/ABC?table=tbl123', text: '表格' }]] });
-  assert.equal(normalizeMessage(post, { botOpenId: '', allowedUsers: new Set() })?.text, '/导入 https://demo.feishu.cn/base/ABC?table=tbl123');
+  const text = normalizeMessage(post, { botOpenId: '', allowedUsers: new Set() })!.text!;
+  assert.deepEqual(bitableRequest(text), { url: 'https://demo.feishu.cn/base/ABC?table=tbl123', question: '' });
   assert.throws(() => bitableUrl('https://evil.example/base/ABC'));
+});
+
+test('多维表格链接与问题可同条发送，并保留子表选择', () => {
+  const url = 'https://demo.feishu.cn/wiki/ABC?table=tbl123';
+  for (const text of [`${url}分析一下`, `分析一下\n${url}&view=vew123`, `/导入 ${url} 分析一下`]) {
+    assert.deepEqual(bitableRequest(text), { url, question: '分析一下' });
+  }
+  assert.throws(() => bitableRequest(`${url}\nhttps://demo.feishu.cn/base/XYZ 分析一下`), /一张/);
+  assert.throws(() => bitableRequest('/导入 https://demo.feishu.cn.evil.example/base/ABC'));
+  assert.throws(() => bitableRequest('https://demo.feishu.cn/share/base/view/shrcn123 分析一下'), { code: 'BITABLE_SHARE_LINK' });
 });
 
 test('文字与附件一起发送：识别顶层 files、本地化正文及内联文件，文件不重复', () => {

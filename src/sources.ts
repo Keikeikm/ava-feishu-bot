@@ -6,6 +6,8 @@ import { UserError } from './errors.js';
 
 export const SUPPORTED_FILES = 'CSV / TSV / JSON / JSONL / NDJSON / XLSX / Parquet / TXT / Markdown / SQLite';
 const extensions = new Set(['.csv', '.tsv', '.json', '.jsonl', '.ndjson', '.xlsx', '.parquet', '.txt', '.md', '.sqlite', '.sqlite3', '.db']);
+const feishuHost = /^(?:[a-z0-9-]+\.)?feishu\.cn$/i;
+const bitablePath = /^\/(?:base|wiki|share\/base)\//;
 
 export function fileExtension(name: string): string {
   const ext = extname(name).toLowerCase();
@@ -17,7 +19,11 @@ export function fileExtension(name: string): string {
 export function bitableUrl(text: string): string {
   let url: URL;
   try { url = new URL(text.trim()); } catch { throw new UserError('请提供完整的飞书多维表格链接。'); }
-  if (url.protocol !== 'https:' || !/^[a-z0-9-]+\.feishu\.cn$/i.test(url.hostname) || url.port || url.username || url.password || !/^\/(base|wiki)\/[a-zA-Z0-9]+\/?$/.test(url.pathname)) {
+  const isFeishuUrl = url.protocol === 'https:' && feishuHost.test(url.hostname) && !url.port && !url.username && !url.password;
+  if (isFeishuUrl && url.pathname.startsWith('/share/base/')) {
+    throw new UserError('这是飞书的发布分享链接。请打开原始多维表格，复制浏览器地址栏里的 /base/ 或 /wiki/ 链接。', 'BITABLE_SHARE_LINK');
+  }
+  if (!isFeishuUrl || !/^\/(base|wiki)\/[a-zA-Z0-9]+\/?$/.test(url.pathname)) {
     throw new UserError('请提供 https://企业域名.feishu.cn/base/... 或 /wiki/... 多维表格链接。');
   }
   // Keep only the information consumed by AVA; discard unrelated tracking parameters.
@@ -29,6 +35,32 @@ export function bitableUrl(text: string): string {
     url.searchParams.set('table', table);
   }
   return url.toString();
+}
+
+export function isBitableLink(text: string): boolean {
+  const url = URL.parse(text);
+  return url?.protocol === 'https:' && feishuHost.test(url.hostname) && bitablePath.test(url.pathname);
+}
+
+export function bitableRequest(text: string): { url: string; question: string } | undefined {
+  const command = /^\/?导入(?:\s+|$)/.exec(text);
+  const input = text.slice(command?.[0].length ?? 0);
+  // Feishu links use ASCII (non-ASCII URL values are percent-encoded). Stop at
+  // Chinese prose even when a plain-text link and the question touch.
+  const links = [...input.matchAll(/https:\/\/[A-Za-z0-9._~:/?@!$&*+,;=%#-]+/gi)].flatMap(match => {
+    const raw = match[0].replace(/[.,;:!?]+$/, '');
+    return isBitableLink(raw) ? [{ url: bitableUrl(raw), start: match.index, end: match.index + raw.length }] : [];
+  });
+  if (new Set(links.map(link => link.url)).size > 1) throw new UserError('请在一条消息里发送一张要分析的多维表格。');
+  const first = links[0];
+  if (!first) {
+    if (command || /^https:\/\//i.test(input)) return { url: bitableUrl(input), question: '' };
+    return undefined;
+  }
+  let question = input;
+  for (const { start, end } of links.reverse()) question = question.slice(0, start) + ' ' + question.slice(end);
+  question = question.replace(/^[\s，,：:；;。]+|[\s，,：:；;。]+$/g, '');
+  return { url: first.url, question };
 }
 
 export async function avaSource(source: DatasetSource): Promise<DataSourceConfig> {

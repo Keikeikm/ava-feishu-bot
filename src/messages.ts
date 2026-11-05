@@ -1,5 +1,6 @@
 import type { Config } from './config.js';
 import type { IncomingMessage, MessageEvent } from './types.js';
+import { isBitableLink } from './sources.js';
 
 type PostPart = { tag?: string; text?: string; href?: string; file_key?: string; file_name?: string; name?: string };
 type Post = { title?: string; content?: PostPart[][]; files?: PostPart[]; zh_cn?: Post; en_us?: Post };
@@ -21,6 +22,7 @@ function parsePost(post: Post): { text: string; files: NonNullable<IncomingMessa
   }
   const text = [typeof value.title === 'string' ? value.title : '', ...lines.map(line => line.map(part => {
     if (!part || typeof part !== 'object') return '';
+    if (part.tag === 'a' && typeof part.href === 'string' && isBitableLink(part.href)) return `\n${part.href}\n`;
     const text = part.tag === 'a' ? part.href || part.text : part.tag === 'text' ? part.text : '';
     return typeof text === 'string' ? text : '';
   }).join(''))].join('\n').trim();

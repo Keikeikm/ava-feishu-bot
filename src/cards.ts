@@ -1,7 +1,8 @@
 import type { AnalysisOutput, DatasetInfo } from './types.js';
 import { SUPPORTED_FILES } from './sources.js';
+import { feishuChart } from './charts.js';
 
-export type Card = ReturnType<typeof card>;
+export type Card = ReturnType<typeof card> | { schema: '2.0'; header: ReturnType<typeof card>['header']; body: { elements: (ReturnType<typeof plain> | ReturnType<typeof feishuChart>)[] } };
 const plain = (text: string) => ({ tag: 'div', text: { tag: 'plain_text', content: text.slice(0, 4000) } });
 function card(title: string, elements: ReturnType<typeof plain>[], color = 'blue') {
   // Keep large schemas and long answers within Feishu's message payload limit.
@@ -12,7 +13,7 @@ function card(title: string, elements: ReturnType<typeof plain>[], color = 'blue
     if (text.length <= remaining) { bounded.push(element); remaining -= text.length; }
     else {
       if (remaining) bounded.push(plain(text.slice(0, remaining)));
-      bounded.push(plain('…内容较多，已截取显示。完整数据请查看原始表格或分析报告附件。'));
+      bounded.push(plain('…内容较多，已截取显示。'));
       break;
     }
   }
@@ -28,18 +29,22 @@ export function rowPreview(rows: Record<string, unknown>[], maxRows = 6): string
 }
 export function helpCard(): Card {
   return card('AVA 数据分析助手', [
-    plain(`先发送表格文件，再直接输入分析问题。\n支持：${SUPPORTED_FILES}\n也可发送 /导入 加上飞书多维表格链接。`),
-    plain('例如：\n按地区汇总销售额，并画柱状图\n哪些产品的利润率最低？\n接着只看华东，按月份比较\n/分析 不画图 统计各地区销售额'),
-    plain('/状态：当前数据概况\n/字段：查看字段与类型\n/预览：查看前几行\n/画像：查看行数和缺失值\n/建议：生成三个分析问题\n/清空：删除自己的数据和追问记录\n/帮助：查看用法'),
+    plain(`发送表格和分析要求，我会给出结论、依据和相关图表。也可以只上传表格，再选择分析方向。\n支持：${SUPPORTED_FILES}\n也可发送 /导入 加上飞书多维表格链接。`),
+    plain('例如：\n分析一下，看看哪些变化值得关注\n按地区汇总销售额，并画柱状图\n接着只看华东，按月份比较\n/分析 不画图 统计各地区销售额'),
+    plain('/建议：看看接下来可以分析什么\n/状态：查看当前使用的文件\n/清空：删除自己的数据和追问记录'),
     plain('群聊中请 @ 机器人提问；数据按「会话 + 发送者」隔离。新文件加载成功后替换旧文件。多表 Excel 可在问题中指定工作表名。'),
   ]);
 }
 export function datasetCard(info: DatasetInfo): Card {
-  const descriptions = info.schema.models.slice(0, 15).map(model => {
-    const rows = info.profile.models.find(p => p.name === model.name)?.metrics.row_count;
-    return `${value(model.name, 60)}：${rows ?? '未知'} 行，${model.columns.length} 列\n字段：${model.columns.slice(0, 10).map(c => value(c.name, 30)).join('、')}${model.columns.length > 10 ? '…' : ''}`;
-  });
-  return card('数据已就绪', [plain(`文件：${info.name}\n共 ${info.schema.models.length} 张表`), plain(descriptions.join('\n\n')), plain('现在可以输入问题，例如「按地区汇总销售额」。使用 /字段、/预览 或 /建议 进一步了解数据。')], 'green');
+  const columns = info.schema.models.flatMap(m => m.columns);
+  const measure = columns.find(c => /销售额|收入|金额|营收/.test(c.name)) || columns.find(c => /INT|DOUBLE|DECIMAL|FLOAT|NUMERIC/i.test(c.type) && !/id|编号/i.test(c.name));
+  const dimension = columns.find(c => /地区|部门|产品|渠道|类别/.test(c.name));
+  const time = columns.find(c => /日期|月份|时间|年月/.test(c.name) || /DATE|TIMESTAMP/i.test(c.type));
+  const questions = ['整体表现如何，最值得关注什么？'];
+  if (measure && dimension) questions.push(`哪些${dimension.name}贡献了最多${measure.name}？`);
+  if (measure && time) questions.push(`${measure.name}随${time.name}发生了什么变化？`);
+  if (questions.length < 3) questions.push('有哪些异常或数据质量问题？');
+  return card('表格已收到', [plain(`已读取 ${info.name}。你可以直接说“分析一下”，也可以选择一个方向：`), plain(questions.slice(0, 3).map((q, i) => `${i + 1}. ${q}`).join('\n'))], 'blue');
 }
 export function fieldsCard(info: DatasetInfo): Card {
   return card('字段与数据类型', info.schema.models.slice(0, 12).map(model => plain(`${model.name}\n${model.columns.slice(0, 50).map(c => `${c.name}：${c.type}`).join('\n')}${model.columns.length > 50 ? '\n…更多字段请查看原始表格' : ''}`)));
@@ -53,14 +58,20 @@ export function profileCard(info: DatasetInfo): Card {
     return plain(`${model.name}：${model.metrics.row_count ?? '未知'} 行\n${nulls.length ? nulls.map(c => `${c.name}：${c.metrics.null_count} 个空值`).join('\n') : '未检测到空值。'}`);
   }));
 }
-export function resultCard(output: AnalysisOutput, name: string): Card {
-  const { result, visualization, chartWarning } = output;
-  const elements = [plain(`数据：${name}\n问题：${result.query.slice(0, 1000)}`), plain(result.text || '分析完成，结果见下方数据。'), plain(`结果预览（返回 ${result.data.length} 行）\n${rowPreview(result.data)}`)];
-  if (result.sql) elements.push(plain(`计算 SQL\n${result.sql.slice(0, 1600)}${result.sql.length > 1600 ? '\n…完整 SQL 见报告附件' : ''}`));
-  if (result.truncated) elements.push(plain('结果达到行数或字节上限，展示和导出均为受限结果。需要完整明细时请缩小筛选范围。'));
-  if (chartWarning) elements.push(plain(chartWarning));
-  elements.push(plain(`将附上分析报告 JSON${result.data.length ? '和结果 CSV' : ''}${visualization ? '，以及可在浏览器打开的图表 HTML' : ''}。`));
-  return card('AVA 分析结果', elements, 'green');
+export function resultCard(output: AnalysisOutput): Card {
+  const summary = output.result.text?.trim() || '暂时没有足够的数据得出结论。你最想比较哪个指标或时间段？';
+  const caveat = output.result.truncated ? [plain('本次计算结果超出返回上限，可以缩小范围继续核实。')] : [];
+  const charts = output.charts?.map(feishuChart) || [];
+  if (!charts.length) return card('分析结论', [plain(summary), ...caveat], 'green');
+  const next = summary.indexOf('【下一步】');
+  const elements = next > 0
+    ? [plain(summary.slice(0, next).trim()), ...charts, plain(summary.slice(next))]
+    : [plain(summary), ...charts];
+  return {
+    schema: '2.0',
+    header: { template: 'green', title: { tag: 'plain_text', content: '分析结论' } },
+    body: { elements: [...elements, ...caveat] },
+  };
 }
 
 /** Quote CSV cells and neutralize spreadsheet formula interpretation in exported strings. */

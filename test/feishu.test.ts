@@ -7,13 +7,47 @@ import { Readable } from 'node:stream';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import * as lark from '@larksuiteoapi/node-sdk';
+import { AVA } from '@antv/ava';
 import { createFeishu } from '../src/feishu.js';
 import { loadConfig } from '../src/config.js';
 import { helpCard } from '../src/cards.js';
 import type { IncomingMessage } from '../src/types.js';
 import { EngineClient } from '../src/engine.js';
 import type { DatasetInfo } from '../src/types.js';
-import { publicFailure } from '../src/errors.js';
+import { bitableReadError, publicFailure } from '../src/errors.js';
+import { avaSource } from '../src/sources.js';
+
+test('AVA 读飞书多维表格：区分 API 权限和文档权限，授权后读出记录', async t => {
+  let deniedCode = 99991672;
+  t.mock.method(globalThis, 'fetch', async (input: string) => {
+    const { pathname } = new URL(input);
+    if (pathname.endsWith('/tenant_access_token/internal')) return Response.json({ code: 0, tenant_access_token: 'fake-token' });
+    if (pathname.endsWith('/apps/bascnFixture/tables')) {
+      if (deniedCode === 99991672) return Response.json({ code: deniedCode, msg: 'Access denied. One of the following scopes is required: [bitable:app:readonly]' }, { status: 400 });
+      return Response.json({ code: 0, data: { items: [{ table_id: 'tblFixture', name: '示例表' }] } });
+    }
+    if (pathname.endsWith('/tables/tblFixture/fields')) {
+      if (deniedCode) return Response.json({ code: deniedCode, msg: 'Permission denied' }, { status: 403 });
+      return Response.json({ code: 0, data: { items: [{ field_name: '类别', type: 3 }, { field_name: '金额', type: 2 }] } });
+    }
+    assert.ok(pathname.endsWith('/tables/tblFixture/records'));
+    return Response.json({ code: 0, data: { items: [{ fields: { 类别: '茶', 金额: 8 } }, { fields: { 类别: '茶', 金额: 12 } }] } });
+  });
+  const ava = new AVA({ engine: { type: 'duckdb' }, llm: { model: 'test', apiKey: 'fake-key' } });
+  const source = await avaSource({ kind: 'bitable', name: '示例表', url: 'https://demo.feishu.cn/base/bascnFixture', appId: 'fake-id', appSecret: 'fake-secret' });
+  const load = () => ava.source(source).catch(error => { throw bitableReadError(error); });
+  try {
+    await assert.rejects(load, { code: 'BITABLE_API_SCOPE', diagnostic: { errorType: 'Error', feishuCode: 99991672 } });
+    deniedCode = 91403;
+    await assert.rejects(load, { code: 'BITABLE_ACCESS_DENIED', diagnostic: { errorType: 'Error', feishuCode: 91403 } });
+    deniedCode = 0;
+    await load();
+    const result = await ava.query('SELECT "类别", SUM("金额") AS "合计" FROM data GROUP BY "类别"');
+    assert.deepEqual(result.data, [{ 类别: '茶', 合计: 20 }]);
+  } finally {
+    await ava.dispose();
+  }
+});
 
 test('飞书真实 SDK 合约：消息资源流下载、multipart 文件上传和卡片回复', async () => {
   const config = loadConfig({ FEISHU_APP_ID: 'contract-test-app', FEISHU_APP_SECRET: 'fake-secret', LLM_MODEL: 'test', LLM_API_KEY: 'fake-key' });

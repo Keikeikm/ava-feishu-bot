@@ -3,6 +3,7 @@ import type { Config } from './config.js';
 import type { AnalysisOutput, DatasetSource } from './types.js';
 import type { VisualizeResponse } from '@antv/ava';
 import { UserError, type Failure } from './errors.js';
+import { requestLogContext } from './logging.js';
 
 interface Pending {
   resolve(value: unknown): void;
@@ -49,13 +50,13 @@ export class EngineClient {
         void this.worker.terminate();
       }, timeoutMs);
       this.pending.set(id, { resolve: value => resolve(value as T), reject, timer });
-      this.worker.postMessage({ id, command, payload });
+      this.worker.postMessage({ id, command, payload, trace: requestLogContext.getStore() });
     });
   }
 
-  async analyze(query: string, charts: boolean): Promise<AnalysisOutput> {
-    const output = await this.request<AnalysisOutput>('analyze', { query });
-    if (charts && output.result.data.length) {
+  async analyze(query: string, options: boolean | { inlineCharts: boolean }): Promise<AnalysisOutput> {
+    const output = await this.request<AnalysisOutput>('analyze', { query, inlineCharts: typeof options === 'object' && options.inlineCharts });
+    if (options === true && output.result.data.length) {
       try { output.visualization = await this.request<VisualizeResponse | null>('visualize', {}, Math.min(this.config.jobTimeoutMs, 60_000)); }
       catch {
         output.chartWarning = this.closed
