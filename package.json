@@ -1,0 +1,25 @@
+{
+  "name": "ava-feishu-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "飞书表格数据分析机器人，基于 AntV AVA 4",
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/main.js",
+    "dev": "npm run build && node --watch dist/src/main.js",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 dist/test/*.test.js",
+    "analyze": "npm run build && node dist/src/cli.js"
+  },
+  "dependencies": {
+    "@antv/ava": "4.0.0",
+    "@larksuiteoapi/node-sdk": "1.76.0",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.3"
+  }
+}
