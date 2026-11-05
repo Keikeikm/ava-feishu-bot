@@ -71,7 +71,9 @@ export async function avaSource(source: DatasetSource): Promise<DataSourceConfig
   }
   const ext = fileExtension(source.name);
   switch (ext) {
-    case '.csv': return { type: 'csv-file', options: { path: source.path, options: { header: true } } };
+    case '.csv': return { type: 'csv-file', options: {
+      path: source.path, options: { header: true, all_varchar: source.prediction?.task === 'classification' || undefined },
+    } };
     case '.tsv': return { type: 'csv-file', options: { path: source.path, options: { header: true, delim: '\t' } } };
     case '.json': return { type: 'json-file', options: { path: source.path } };
     case '.jsonl': case '.ndjson': return { type: 'json-file', options: { path: source.path, options: { format: 'newline_delimited' } } };

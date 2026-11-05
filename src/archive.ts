@@ -47,11 +47,21 @@ export function isArchivePrediction(text: string): boolean {
     || /(?:机器学习[\s\S]*预测|预测[\s\S]*机器学习|(?:预测|训练)[\s\S]*(?:测试集|test\.csv|提交文件|submission\.csv)|^预测(?:$|\s|一下|测试))/iu.test(text);
 }
 
+export function refersToSubmission(text: string): boolean {
+  return /(?:^|[^a-z0-9_.-])submission\.csv(?![a-z0-9_.-])/i.test(text)
+    || /(?:生成的|刚才的|上一轮的?|刚刚的|上次的|本次的|刚生成的)?预测(?:数据|结果|输出|值)|预测分布/.test(text);
+}
+
+export function isSubmissionOverview(text: string): boolean {
+  return /^(?:(?:请(?:你)?(?:帮我)?|帮我)\s*)?(?:(?:对|把|将)\s*)?(?:(?:刚才|刚刚|刚|上一轮)?生成的|刚才的|上一轮的|上次的)?\s*(?:(?:预测(?:数据|结果|输出|值)|submission\.csv)\s*(?:进行|做|的)?)?\s*(?:可视化|画(?:一张|个|一下)?图|展示分布|看(?:一下)?分布|统计分布)[。！？!?\s]*$/i.test(text);
+}
+
 export function isSubmissionComparison(text: string): boolean {
   if (/^\/(?:分析|预测|predict|训练|train)(?:\s|$)/i.test(text)) return false;
   return /^\/(?:对比|评估)(?:\s|$)/.test(text)
     || (/(?:对比|比较|核对|校验|检验|验证|评估|正确率|准确率|误差)/.test(text)
-      && /(?:预测|真实(?:值|结果|标签)|参考(?:值|结果|标签)|答案|ground\s*truth)/i.test(text));
+      && (/(?:真实(?:值|结果|标签)|参考(?:值|结果|标签)|答案|ground\s*truth)/i.test(text)
+        || (/预测/.test(text) && /(?:正确率|准确率|误差|\.csv)/i.test(text))));
 }
 
 export function comparisonFile(archive: Archive, text: string): ArchiveFile {

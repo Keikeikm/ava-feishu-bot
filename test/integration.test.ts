@@ -182,6 +182,12 @@ with zipfile.ZipFile(root / "unsafe.zip", "w") as archive:
     bot.accept(event('select', '/选文件 1'));
     upload('unsafe', 'unsafe.zip');
     bot.accept(event('predict', '请用机器学习预测'));
+    bot.accept(event('prediction-chart', '请你对生成的预测数据进行可视化'));
+    await waitFor(() => sent.some(item => item.id === 'prediction-chart' && item.content.includes('预测类别分布')));
+    bot.accept(event('prediction-followup', '画个图'));
+    await waitFor(() => sent.some(item => item.id === 'prediction-followup' && item.content.includes('预测类别分布')));
+    bot.accept(event('prediction-export', '/导出 CSV'));
+    await waitFor(() => files.has('prediction-export'));
     upload('with-prompt', 'challenge.zip', '/预测 --目标 Survived --分类');
     await waitFor(() => files.has('with-prompt'));
     bot.accept(event('model-question', '你刚才用什么模型训练的？'));
@@ -205,7 +211,14 @@ with zipfile.ZipFile(root / "unsafe.zip", "w") as archive:
     for (const id of ['predict', 'with-prompt']) {
       assert.deepEqual(files.get(id), { name: 'submission.csv', content: 'Survived,Id\r\n1,00124\r\n0,00123\r\n' }, JSON.stringify(sent.filter(item => item.id === id)));
     }
-    assert.equal(files.size, 2);
+    assert.equal([...files.values()].filter(file => file.name === 'submission.csv').length, 2);
+    for (const id of ['prediction-chart', 'prediction-followup']) {
+      const reply = JSON.parse(sent.find(item => item.id === id && item.content.includes('预测类别分布'))!.content);
+      assert.match(JSON.stringify(reply), /上一轮 submission.csv 的「Survived」预测共 2 条/);
+      const chart = reply.body.elements.find((element: { tag: string }) => element.tag === 'chart');
+      assert.deepEqual(chart.chart_spec.data.values, [{ label: '0', value: 1 }, { label: '1', value: 1 }]);
+    }
+    assert.match(files.get('prediction-export')!.content, /预测类别.*预测条数/);
     assert.ok(sent.some(item => item.id === 'compare-template' && item.content.includes('一致率 0.00%') && item.content.includes('提交示例')));
     assert.ok(sent.some(item => item.id === 'compare-labels' && item.content.includes('按所提供标签计算的准确率 50.00%')));
     assert.ok(sent.some(item => item.id === 'compare-unlabeled' && item.content.includes('缺少目标列「Survived」')));

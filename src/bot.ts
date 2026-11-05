@@ -13,7 +13,7 @@ import { UserError, publicFailure } from './errors.js';
 import { datasetCard, fieldsCard, helpCard, previewCard, profileCard, resultCard, resultCsv, trainingCard } from './cards.js';
 import { elapsedMs, inputLogFields, logEvent, requestLogContext } from './logging.js';
 import { isTrainingModelQuestion, isTrainingRequest, resolveTrainingRequest, selectedTrainingModel, trainingMetric, trainingSummary, trainModel, type TrainingInput } from './training.js';
-import { archiveGuide, compareSubmission, comparisonFile, isArchivePrediction, isSubmissionComparison, mentionedArchiveFiles, openArchive, predictArchive } from './archive.js';
+import { archiveGuide, compareSubmission, comparisonFile, isArchivePrediction, isSubmissionComparison, mentionedArchiveFiles, openArchive, predictArchive, refersToSubmission } from './archive.js';
 
 // Only match standalone schema questions, so questions that also request analysis keep using AVA.
 const fieldsQuestion = /^(?:(?:请(?:帮我)?|帮我)\s*)?(?:介绍(?:一下)?|列出|查看|看一下)\s*(?:这[份张]表(?:格)?(?:里|中)?(?:的)?|当前表(?:格)?(?:的)?|数据(?:表)?(?:的)?)?\s*(?:字段|列名)(?:\s*(?:分别)?(?:是什么|有哪些|有什么))?[。！？!?\s]*$/;
@@ -23,7 +23,7 @@ export class Bot {
   private seen = new Deduplicator();
   private queue = new JobQueue();
   constructor(private config: Config, private runtimeDir: string, private messenger: Messenger,
-    private sessions: Pick<Sessions, 'replace' | 'replaceArchive' | 'archive' | 'useArchive' | 'selectArchiveFile' | 'recordTraining' | 'latestTraining' | 'info' | 'run' | 'clear' | 'close'>) {}
+    private sessions: Pick<Sessions, 'replace' | 'replaceArchive' | 'archive' | 'useArchive' | 'selectArchiveFile' | 'recordTraining' | 'latestTraining' | 'recordSubmission' | 'runSubmission' | 'info' | 'run' | 'clear' | 'close'>) {}
 
   // Intentionally synchronous: the Feishu event handler can ACK within 3 seconds.
   accept(event: MessageEvent): void {
@@ -129,6 +129,9 @@ export class Bot {
       }
       let text = bitable?.question ?? message.text ?? '';
       const archive = this.sessions.archive(message.sessionKey);
+      let analyzeSubmission = !bitable && !message.file && refersToSubmission(text)
+        && (!!archive || /刚才|刚刚|上一轮|生成的|submission\.csv/i.test(text))
+        && (!text.startsWith('/') || /^\/分析(?:\s|$)/.test(text));
       if (archive && comparison) throw new UserError('请先为当前 ZIP 发送 /预测，再对比参考文件。', 'ML_NO_SUBMISSION');
       if (archive && isArchivePrediction(text)) {
         await this.sessions.useArchive(message.sessionKey, async state => {
@@ -142,7 +145,7 @@ export class Bot {
           const best = result.report.scores.find(score => score.model === result.report.selected)!;
           const metric = trainingMetric(best);
           await this.messenger.file(message, 'submission.csv', Buffer.from(result.csv, 'utf8'));
-          state.submission = { csv: result.csv, target: result.target, task: result.report.task, template: result.template };
+          await this.sessions.recordSubmission(message.sessionKey, { csv: result.csv, target: result.target, task: result.report.task, template: result.template });
           this.sessions.recordTraining(message.sessionKey, {
             source: `${source.name} / train.csv`, target: result.target, report: result.report, predictionRows: result.rows,
           });
@@ -166,7 +169,9 @@ export class Bot {
       if (archive && !/^(?:\/?(?:清空|帮助|help)|你好|您好|hello|hi|嗨|在吗)[!！?？。\s]*$/i.test(text)) {
         const question = text.replace(/^\/?分析\s+/, '');
         const files = archive.source.files;
-        const matches = !text.startsWith('/') || /^\/分析(?:\s|$)/.test(text) ? mentionedArchiveFiles(files, question) : [];
+        const matches = !text.startsWith('/') || /^\/分析(?:\s|$)/.test(text)
+          ? mentionedArchiveFiles(files, question).filter(index => !(analyzeSubmission && /^submission\.csv$/i.test(files[index]!.entry)))
+          : [];
         if (matches.length > 1) {
           const choices = matches.map(index => `${index + 1}. ${files[index]!.entry}`).join('\n');
           throw new UserError(`这句话匹配到多个文件。请用 /选文件 加编号选择其中一个，也可以在问题中写完整路径。\n${choices}`, 'ZIP_SELECT', 'source');
@@ -179,13 +184,18 @@ export class Bot {
             question.toLowerCase().startsWith(name.toLowerCase()) && /^(?:\s|$)/u.test(question.slice(name.length)));
           const query = prefix ? question.slice(prefix.length).trim() : question;
           if (!query) { await this.messenger.card(message, datasetCard(info)); return; }
+          analyzeSubmission = false;
           text = `/分析 ${query}`;
-        } else if (archive.selected === undefined) {
+        } else if (archive.predictionFocused && (!text.startsWith('/') || /^\/分析(?:\s|$)/.test(text))
+            && !isTrainingRequest(text) && !/^(?:状态|字段|预览|画像|建议|导出(?:\s*(?:CSV|JSON|图表))?)$/i.test(text)
+            && !fieldsQuestion.test(text) && !fieldsListQuestion.test(text)) {
+          analyzeSubmission = true;
+        } else if (!analyzeSubmission && archive.selected === undefined && !/^\/?导出(?:\s*(?:CSV|JSON|图表))?$/i.test(text)) {
           if (archive.source.files.length === 1) await this.sessions.selectArchiveFile(message.sessionKey, 0);
           else { await this.messenger.text(message, archiveGuide(archive.source)); return; }
         }
       }
-      if (isTrainingRequest(text)) {
+      if (!analyzeSubmission && isTrainingRequest(text)) {
         const info = await this.sessions.info(message.sessionKey);
         const training = resolveTrainingRequest(text, info);
         const dataset = { file_name: info.name, table: training.table, target: training.target, task: training.task };
@@ -230,13 +240,15 @@ export class Bot {
       }
       if (/^\/?导出(?:\s*(CSV|JSON|图表))?$/i.test(text)) {
         const format = text.match(/(CSV|JSON|图表)$/i)?.[1]?.toLowerCase() || 'csv';
-        const output = await this.sessions.run<AnalysisOutput>(message.sessionKey, 'export');
+        const run = <T>(command: 'export' | 'visualize') => archive?.predictionFocused
+          ? this.sessions.runSubmission<T>(message.sessionKey, command) : this.sessions.run<T>(message.sessionKey, command);
+        const output = await run<AnalysisOutput>('export');
         if (format === 'json') {
           const { query, text, data, truncated } = output.result;
           await this.messenger.file(message, 'analysis-report.json', Buffer.from(JSON.stringify({ query, text, data, truncated }, null, 2)));
         } else if (format === '图表') {
           if (!this.config.enableCharts) throw new UserError('当前未开启图表导出，请联系管理员。');
-          const chart = await this.sessions.run<import('@antv/ava').VisualizeResponse | null>(message.sessionKey, 'visualize');
+          const chart = await run<import('@antv/ava').VisualizeResponse | null>('visualize');
           if (!chart) { await this.messenger.text(message, '这次结果不适合绘制图表，可以继续提问或导出 CSV。'); return; }
           await this.messenger.file(message, 'analysis-chart.html', Buffer.from(chart.html));
         } else {
@@ -251,6 +263,12 @@ export class Bot {
       if (text.startsWith('/') && !/^\/分析(?:\s|$)/.test(text)) throw new UserError('未识别此命令，发送 /帮助 查看用法。');
       if (!query) throw new UserError('请输入分析问题，或发送“分析一下”获取整体判断。');
       if (query.length > 6000) throw new UserError('问题最多支持 6000 个字符，请精简后重试。');
+      if (analyzeSubmission) {
+        if (!archive?.hasSubmission) throw new UserError('当前会话还没有可分析的预测结果。请上传 ZIP 并先发送 /预测。', 'ML_NO_SUBMISSION');
+        const output = await this.sessions.runSubmission<AnalysisOutput>(message.sessionKey, 'analyze', { query, inlineCharts });
+        await this.messenger.card(message, resultCard(output));
+        return;
+      }
       await this.sessions.info(message.sessionKey);
       if (!message.file && !bitable) await this.messenger.text(message, '正在分析，请稍候。');
       const output = await this.sessions.run<AnalysisOutput>(message.sessionKey, 'analyze', { query, inlineCharts });

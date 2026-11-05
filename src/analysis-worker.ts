@@ -3,6 +3,7 @@ import { AVA, type AnalysisResponse, type ExecutionResult, type LLMConfig } from
 import { avaSource } from './sources.js';
 import { loadBitable } from './bitable.js';
 import { analysisPrompt } from './analysis-prompt.js';
+import { isSubmissionOverview } from './archive.js';
 import { chartConclusion, inlineCharts } from './charts.js';
 import { bitableReadError, publicFailure, UserError, type FailureStage } from './errors.js';
 import { elapsedMs, logEvent, requestLogContext, type RequestLogContext } from './logging.js';
@@ -123,7 +124,9 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
   if (command !== 'analyze' || !payload.query?.trim()) throw new UserError('请输入要分析的问题。');
   const query = payload.query.trim();
   if (query.length > 6000) throw new UserError('问题最多支持 6000 个字符，请精简后重试。');
-  const context = history.length ? `\n以下是同一份数据的历史问题与查询，用于理解本次追问。每次都需要重新执行查询。\n${JSON.stringify(history)}\n` : '';
+  const prediction = settings.source.kind === 'file' ? settings.source.prediction : undefined;
+  const predictionContext = prediction ? `\n当前表是同一会话上一轮生成的测试集预测 submission.csv，预测目标为 ${JSON.stringify(prediction.target)}。请把目标值描述为预测值；没有真实标签可用来计算准确率。画分布图时，分类用各预测类别计数，回归用数值分箱计数。\n` : '';
+  const context = predictionContext + (history.length ? `\n以下是同一份数据的历史问题与查询，用于理解本次追问。每次都需要重新执行查询。\n${JSON.stringify(history)}\n` : '');
   currentStage = 'analysis';
   const startedAt = performance.now();
   if (requestLogContext.getStore()) {
@@ -133,19 +136,29 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
     maxRows: settings.maxResultRows, maxResultBytes: 512 * 1024, strategy: { type: 'direct', maxRetries: 2 },
   } as const;
   let result: AnalysisResponse;
-  activeAnalysis = payload.inlineCharts ? {} : undefined;
-  try {
-    result = await ava.analyze(analysisPrompt(query, info, context, payload.inlineCharts), options);
-  } catch (error) {
-    if (activeAnalysis?.summaryFailed && activeAnalysis.execution) {
-      result = { ...activeAnalysis.execution, query, sql: activeAnalysis.sql, text: '' };
-      result.text = chartConclusion(inlineCharts(result)[0]);
-      if (requestLogContext.getStore()) logEvent('analysis_summary_fallback', {}, 'warn');
-    } else {
-      throw error;
+  const predictionOverview = prediction?.task === 'classification' && isSubmissionOverview(query);
+  if (predictionOverview) {
+    const target = identifier(prediction.target);
+    const sql = `SELECT CAST(${target} AS VARCHAR) AS "预测类别", COUNT(*) AS "预测条数" FROM data GROUP BY 1 ORDER BY 2 DESC, 1`;
+    const execution = await ava.query(sql, { maxRows: 20 });
+    const total = execution.data.reduce((sum, row) => sum + Number(row.预测条数), 0);
+    const distribution = execution.data.map(row => `${row.预测类别}：${row.预测条数} 条（${(100 * Number(row.预测条数) / total).toFixed(1)}%）`).join('；');
+    result = { ...execution, query, sql, text: `上一轮 submission.csv 的「${prediction.target}」预测共 ${total} 条。\n${distribution}。\n图表统计的是模型预测类别。` };
+  } else {
+    activeAnalysis = payload.inlineCharts ? {} : undefined;
+    try {
+      result = await ava.analyze(analysisPrompt(query, info, context, payload.inlineCharts), options);
+    } catch (error) {
+      if (activeAnalysis?.summaryFailed && activeAnalysis.execution) {
+        result = { ...activeAnalysis.execution, query, sql: activeAnalysis.sql, text: '' };
+        result.text = chartConclusion(inlineCharts(result)[0]);
+        if (requestLogContext.getStore()) logEvent('analysis_summary_fallback', {}, 'warn');
+      } else {
+        throw error;
+      }
+    } finally {
+      activeAnalysis = undefined;
     }
-  } finally {
-    activeAnalysis = undefined;
   }
   result.query = query;
   if (info.labelCaveat) result.text = `${result.text.trim()}\n【标签口径】${info.labelCaveat}`.trim();
@@ -154,7 +167,10 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
   lastResult = result;
   const output: AnalysisOutput = { result, visualization: null };
   if (payload.inlineCharts) {
-    output.charts = inlineCharts(result);
+    output.charts = predictionOverview ? [{
+      kind: 'bar', title: `${prediction.target} 预测类别分布（条）`, limited: !!result.truncated,
+      points: result.data.map(row => ({ label: String(row.预测类别), value: Number(row.预测条数) })),
+    }] : inlineCharts(result);
     if (requestLogContext.getStore()) logEvent('analysis_charts_prepared', { chart_count: output.charts.length });
   }
   if (requestLogContext.getStore()) {

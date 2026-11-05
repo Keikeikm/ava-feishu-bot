@@ -2,7 +2,7 @@ import type { AnalysisResponse, Profile, Schema, VisualizeResponse } from '@antv
 import type { InlineChart } from './charts.js';
 
 export type DatasetSource =
-  | { kind: 'file'; path: string; name: string }
+  | { kind: 'file'; path: string; name: string; prediction?: { task: 'classification' | 'regression'; target: string } }
   | { kind: 'bitable'; url: string; name: string; appId: string; appSecret: string };
 
 export interface DatasetInfo {

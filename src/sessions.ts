@@ -1,4 +1,5 @@
-import { rm } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { Config } from './config.js';
 import type { DatasetInfo, DatasetSource } from './types.js';
 import { EngineClient } from './engine.js';
@@ -7,7 +8,12 @@ import { logEvent, requestLogContext } from './logging.js';
 import type { Archive, SavedSubmission } from './archive.js';
 import type { TrainingRun } from './training.js';
 
-interface ArchiveSession { source: Archive; submission?: SavedSubmission }
+interface ArchiveSession {
+  source: Archive;
+  submission?: SavedSubmission;
+  submissionEngine?: EngineClient;
+  predictionFocused?: boolean;
+}
 
 interface Session {
   engine?: EngineClient;
@@ -70,10 +76,13 @@ export class Sessions {
     return session.info;
   }
 
-  archive(key: string): { source: Archive; selected?: number } | undefined {
+  archive(key: string): { source: Archive; selected?: number; predictionFocused: boolean; hasSubmission: boolean } | undefined {
     const session = this.entries.get(key);
     if (session?.archive && (session.busy || Date.now() - session.touched < this.config.sessionTtlMs)) {
-      return { source: session.archive.source, selected: session.engine?.closed ? undefined : session.activeFile };
+      return {
+        source: session.archive.source, selected: session.engine?.closed ? undefined : session.activeFile,
+        predictionFocused: !!session.archive.predictionFocused, hasSubmission: !!session.archive.submission,
+      };
     }
   }
 
@@ -105,7 +114,10 @@ export class Sessions {
     const session = await this.get(key);
     const file = session.archive?.source.files[index];
     if (!file) throw new UserError('找不到该文件编号，发送 /状态 查看压缩包文件列表。', 'ZIP_SELECT');
-    if (session.activeFile === index && session.engine && !session.engine.closed && session.info) return session.info;
+    if (session.activeFile === index && session.engine && !session.engine.closed && session.info) {
+      session.archive!.predictionFocused = false;
+      return session.info;
+    }
     const engine = new EngineClient({ kind: 'file', path: file.path, name: file.name }, this.config, session.directory);
     session.busy++;
     try {
@@ -114,11 +126,49 @@ export class Sessions {
       session.engine = engine;
       session.info = info;
       session.activeFile = index;
+      session.archive!.predictionFocused = false;
       await previous?.close();
       return info;
     } catch (error) {
       if (session.engine !== engine) await engine.close();
       throw error;
+    } finally { session.busy--; session.touched = Date.now(); }
+  }
+
+  async recordSubmission(key: string, submission: SavedSubmission): Promise<void> {
+    await this.useArchive(key, async archive => {
+      const previous = archive.submissionEngine;
+      archive.submission = submission;
+      archive.submissionEngine = undefined;
+      archive.predictionFocused = true;
+      await previous?.close();
+    });
+  }
+
+  async runSubmission<T>(key: string, command: 'analyze' | 'export' | 'visualize', payload?: { query: string; inlineCharts: boolean }): Promise<T> {
+    const session = await this.get(key);
+    const archive = session.archive;
+    if (!archive?.submission) throw new UserError('当前会话还没有可分析的预测结果。请上传 ZIP 并先发送 /预测。', 'ML_NO_SUBMISSION');
+    session.busy++;
+    try {
+      let engine = archive.submissionEngine;
+      if (!engine || engine.closed) {
+        if (command !== 'analyze') throw new UserError('请先分析一次预测结果，再导出。', 'NO_ANALYSIS');
+        await engine?.close();
+        const path = join(session.directory, 'submission.csv');
+        await writeFile(path, archive.submission.csv, { mode: 0o600 });
+        const { task, target } = archive.submission;
+        engine = new EngineClient({ kind: 'file', path, name: 'submission.csv', prediction: { task, target } }, this.config, session.directory);
+        try { await engine.request<DatasetInfo>('load'); }
+        catch (error) { await engine.close(); throw error; }
+        archive.submissionEngine = engine;
+      }
+      if (command === 'analyze' && payload) {
+        const output = await engine.analyze(payload.query, { inlineCharts: payload.inlineCharts });
+        archive.predictionFocused = true;
+        return output as T;
+      }
+      return await engine.request<T>(command);
     } finally { session.busy--; session.touched = Date.now(); }
   }
 
@@ -167,7 +217,7 @@ export class Sessions {
   }
 
   private async destroy(session: Session): Promise<void> {
-    await session.engine?.close();
+    await Promise.all([session.engine?.close(), session.archive?.submissionEngine?.close()]);
     await rm(session.directory, { recursive: true, force: true });
   }
 
