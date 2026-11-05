@@ -150,6 +150,13 @@ test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图�
     upload.message.content = JSON.stringify({ file_key: 'file_test', file_name: 'sales.csv' });
     bot.accept(upload);
     await waitFor(() => sent.some(s => s.id === 'upload' && s.kind === 'card'));
+    const priorModelCalls = prompts.length;
+    bot.accept(event('fields', '介绍一下数据字段分别是什么？'));
+    await waitFor(() => sent.some(s => s.id === 'fields' && s.kind === 'card'));
+    const fieldReplies = sent.filter(s => s.id === 'fields');
+    assert.deepEqual(fieldReplies.map(reply => reply.kind), ['card']);
+    assert.match(JSON.stringify(fieldReplies[0]?.data), /字段与数据类型.*销售额/);
+    assert.equal(prompts.length, priorModelCalls);
     const question = event('question', '按地区汇总销售额并画柱状图');
     bot.accept(question); bot.accept(question);
     bot.accept(event('report1', '/导出 JSON'));

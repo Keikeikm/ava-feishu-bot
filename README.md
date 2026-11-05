@@ -1,227 +1,197 @@
 # AVA 飞书数据分析机器人
 
-发送表格和分析要求，机器人通过 **AntV AVA 4.0.0 + DuckDB** 执行真实统计，把结论、关键依据、交互图表和一个具体的下一步问题放在同一张飞书卡片里。“分析一下”会主动分析整体表现、趋势和主要差异。支持同一份数据连续追问。
+把表格和问题发给飞书机器人，就能收到结论、关键依据和交互图表，也可以围绕同一份数据继续追问。机器人用 **AntV AVA 4.0.0 + DuckDB** 计算结果，用 DeepSeek 或其他兼容模型理解问题和撰写结论。发送 `/训练 目标列` 可以在本机训练和评估分类模型。
 
-使用飞书官方 Node SDK 的 **WebSocket 长连接**，本地或服务器运行均可，不需要公网回调地址。需要创建有接收消息能力的「企业自建应用机器人」。
+[快速开始](#快速开始) · [在飞书使用](#在飞书使用) · [训练分类模型](#训练分类模型) · [部署与运行](#部署与运行) · [排查问题](#排查问题) · [本地验证](#本地验证)
 
-```mermaid
-flowchart LR
-    A[飞书发送表格] --> B[下载与格式校验]
-    B --> C[AVA source / schema / profile]
-    D[分析提示词与追问] --> E[AVA analyze]
-    C --> E
-    E --> F[DuckDB 执行只读 SQL]
-    F --> G[文字结论和飞书卡片内的交互图表]
-    F --> H[按需导出 CSV / JSON / HTML]
-```
+## 快速开始
 
-## 支持的数据
+本地运行需要 macOS 或 Linux，以及 Node.js **22.13 或以上**。项目通过飞书官方 Node SDK 建立 WebSocket 长连接，无需公网回调地址。
 
-| 输入 | AVA 接口 | 说明 |
-| --- | --- | --- |
-| `.csv` / `.tsv` | `csv-file` | 第一行是表头；TSV 使用制表符 |
-| `.json` | `json-file` | 推荐对象数组，字段名作为列名 |
-| `.jsonl` / `.ndjson` | `json-file` | 每行一个 JSON 对象 |
-| `.xlsx` | `excel` | 所有工作表分别加载，可按表名分析或关联 |
-| `.parquet` | `parquet` | 保留文件中的类型信息 |
-| `.txt` / `.md` | `text` | 由模型抽取结构化数据，最多 256 KB，UTF-8 编码 |
-| `.sqlite` / `.sqlite3` / `.db` | `sqlite` | 只读加载 SQLite 中的表 |
-| 飞书多维表格链接 | `feishu-bitable` | `/导入 https://企业.feishu.cn/base/...?...`；支持 wiki 中的多维表格 |
+### 1. 创建飞书应用
 
-Excel 接口支持 `.xlsx`；旧 `.xls` 请先另存为 `.xlsx` 或 CSV。CSV/文本建议使用 UTF-8。Excel/SQLite 首次使用时，DuckDB 会下载官方扩展，运行环境需要能访问扩展服务器，且运行用户的主目录可写。
+在[飞书开发者后台](https://open.feishu.cn/app)创建**企业自建应用**，添加「机器人」能力，保存 App ID 和 App Secret。进入「权限管理」，开通以下**应用身份**权限。
 
-AVA 还支持 MySQL、PostgreSQL、MongoDB、Supabase、ClickHouse 等数据库连接；此机器人提供的是**文件上传和多维表格链接**入口，未开放在聊天中提交数据库连接凭据的功能。
+| 权限 | 用途 |
+| --- | --- |
+| `im:message.p2p_msg:readonly` | 接收用户发给机器人的私聊消息 |
+| `im:message:readonly` | 下载消息里的表格附件 |
+| `im:message:send_as_bot` | 以机器人身份回复 |
+| `im:resource` | 上传导出文件等消息资源 |
 
-## 本地启动
+[权限导入 JSON](docs/feishu-permissions.json)同时包含群聊权限。只需要私聊时，开通上表四项即可。多维表格和群聊的额外配置见下文。
 
-要求 macOS / Linux，Node.js **22.13 或以上**。
+### 2. 安装并启动
+
+在项目根目录运行：
 
 ```bash
-cd /Users/keikei/ava-feishu-bot
 nvm use
 npm ci
-cp .env.example .env
+test -f .env || cp .env.example .env
 ```
 
-在 `.env` 中填写：
+在 `.env` 中填写飞书凭证和模型配置。示例使用项目默认的 DeepSeek 配置。
 
 ```dotenv
 FEISHU_APP_ID=你的飞书应用AppID
 FEISHU_APP_SECRET=你的飞书应用AppSecret
-LLM_API_KEY=你的模型APIKey
-LLM_MODEL=你的模型标识
-LLM_BASE_URL=https://模型供应商的兼容接口地址/v1
+LLM_API_KEY=你的DeepSeek_API_Key
+LLM_MODEL=deepseek-flash
+LLM_BASE_URL=https://api.deepseek.com
 ```
 
-`LLM_BASE_URL` 填 API 根地址，AVA 会调用其 `/chat/completions`。填写模型供应商提供的地址和模型 ID；接口应支持 Chat Completions 和纯文本 JSON 输出。使用供应商默认地址时可按其配置要求留空。
-
-然后运行：
+[创建 DeepSeek API Key](https://platform.deepseek.com/api_keys)。使用其他供应商时，填写其模型标识和兼容 Chat Completions 的 API 根地址，AVA 会在根地址后调用 `/chat/completions`。模型需要支持以文本返回 JSON。 [DeepSeek 接入文档](https://api-docs.deepseek.com/zh-cn/)
 
 ```bash
 npm run build
 npm start
 ```
 
-日志出现「长连接已连接」后可以接收消息。开发时使用 `npm run dev`；修改 TypeScript 后需要重新构建。
+### 3. 订阅事件并发布
 
-## 飞书开放平台配置
+保持服务运行。在飞书开发者后台打开「事件与回调」，选择「使用长连接接收事件」，订阅 `im.message.receive_v1`。在「版本管理与发布」发布版本，确认测试账号在应用可用范围内，并完成租户要求的审核。事件或权限修改后需要重新发布。 [飞书长连接接入说明](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)
 
-1. 打开 [飞书开发者后台](https://open.feishu.cn/app)，创建**企业自建应用**，添加「机器人」能力。复制 App ID 和 App Secret 到本地 `.env`。
-2. 在「权限管理」开通以下**应用身份**权限。可以使用 [私聊权限 JSON](docs/feishu-permissions.json) 批量导入。
+### 4. 私聊验证
 
-   | 权限 | 用途 |
-   | --- | --- |
-   | `im:message.p2p_msg:readonly` | 接收用户发给机器人的私聊消息和文件 |
-   | `im:message:readonly` | 通过消息资源接口下载用户发来的附件 |
-   | `im:message:send_as_bot` | 回复分析结果 |
-   | `im:resource` | 上传分析结果附件等资源 |
+在终端确认出现「长连接已连接」。向机器人发送 [sales.csv](examples/sales.csv)，收到「表格已收到」后问 **按地区汇总销售额，并画柱状图**。也可以在同一条消息里附上文件并写问题。示例汇总应为华东 **45000**、华南 **20000**、华北 **11000**。
 
-   `im:message.p2p_msg:readonly` 控制私聊事件推送，`im:message:readonly` 控制通过消息资源 API 读取附件，`im:resource` 控制资源上传等操作。三者不能互相替代。如果能收到消息但附件下载提示 `99991672`，应根据返回的 `permission_violations` 核对具体缺失权限。
+## 在飞书使用
 
-3. 启动本服务。在「事件与回调」中选择**使用长连接接收事件**，订阅 `im.message.receive_v1`（接收消息）。长连接模式下无需填写回调 URL、Verification Token 或 Encrypt Key。
-4. 在「版本管理与发布」创建并发布版本，确认当前用户在应用可用范围内；按租户要求完成管理员审核。权限修改后也需要重新发布。
-5. 在飞书中打开机器人私聊，先发送 [示例销售表](examples/sales.csv)，待收到「数据已就绪」后输入：`按地区汇总销售额，并画柱状图`。之后可以继续问：`只看华东，按月份比较`。
+### 分析与追问
 
-### 在群聊使用
+| 想做什么 | 给机器人发什么 |
+| --- | --- |
+| 查看整体表现 | `分析一下` |
+| 分组计算或画图 | `按地区汇总销售额，并画柱状图` |
+| 沿用上一问的范围 | `只看华东，再按月份比较` |
+| 查看字段名和类型 | `/字段` 或 `介绍一下数据字段分别是什么？` |
+| 查看当前文件、预览或缺失值 | `/状态`、`/预览`、`/画像` |
+| 获取分析问题建议 | `/建议` |
+| 只看文字结论 | `/分析 不画图 按地区汇总销售额` |
+| 清除当前数据和追问记录 | `/清空` |
 
-将机器人加入群，并额外申请 `im:message.group_at_msg:readonly`。填写 `.env` 中的 `FEISHU_BOT_OPEN_ID`（`ou_` 开头），用于区分用户 @ 的是否为当前机器人。可在飞书 API 调试台调用「获取机器人信息」接口 `/open-apis/bot/v3/info`，读取 `bot.open_id`。
+分析卡给出结论、依据和可继续追问的方向。结果适合可视化时，卡片会显示用实际计算值绘制的图表。默认在卡片中交付结果，附件按需导出。
 
-群聊中文件消息无法携带 @，因此要在群里直接发送文件，还需要开通 `im:message.group_msg`（接收群聊所有消息）并发布。如果暂时没有此权限，可以先在私聊上传并分析；或者在群里 @ 机器人，使用 `/导入` 读取多维表格链接。普通群聊文字只响应 @ 当前机器人的消息。
+| 命令 | 下载内容 |
+| --- | --- |
+| `/导出` 或 `/导出 CSV` | 上一次计算结果 |
+| `/导出 JSON` | 上一次的结论和计算结果 |
+| `/导出 图表` | 图表 HTML，需开启 `ENABLE_CHARTS`，打开时需要联网加载 GPT-Vis |
 
-会话以「chat_id + 用户 open_id」隔离；群内另一人的提问不会读到你的数据，私聊与群聊也不共用上传文件。机器人在群内回复的分析结果对群成员可见。
+同一会话中，每位用户有自己的数据和追问记录。成功导入新文件后会替换该用户的旧数据，导入失败时保留旧数据。一次发送一个附件，多张 Excel 工作表可以放在同一个 `.xlsx` 里，提问时写明表名和关联键。
 
-### 读取飞书多维表格
+### 导入飞书多维表格
 
-在开发者后台开通应用身份权限 `bitable:app:readonly` 并发布。读取 wiki 链接时还需对应的知识库读取权限（如 `wiki:wiki:readonly`）。然后在表格的「更多 → 添加文档应用」中授权同一个应用。表格协作者权限与开放平台 API 权限分别生效；开启高级权限的表格还需要核对目标子表的读取范围。
-
-可以把链接和分析要求放在同一条消息里，直接粘贴链接或发送带预览的多维表格卡片。例如：
+1. 为机器人应用开通应用身份权限 `bitable:app:readonly` 并发布。对于 `/wiki/` 链接，还要配置对应的知识库读取权限（如 `wiki:wiki:readonly`）和知识空间访问权限。
+2. 在表格右上角「更多 → 添加文档应用」授权同一个机器人。应用的 API 权限和具体表格的访问权限需分别配置。启用高级权限时，也要检查目标子表的权限。 [飞书多维表格权限说明](https://open.feishu.cn/document/docs/bitable-v1/faq?lang=zh-CN)
+3. 发送原表地址或带预览的链接。可以一起写「分析一下」，也可以只发送链接或 `/导入 链接`，加载后再提问。
 
 ```text
 https://你的企业.feishu.cn/base/你的AppToken
 分析一下
 ```
 
-整份 Base 链接会导入所有数据表，概览按表给出发现。可以指定表名继续提问，也可以按可靠的关联键跨表计算。带 `table=` 的链接用于单独导入指定子表。只发链接或使用 `/导入 链接` 会先加载数据，再等待分析问题。
+整份 Base 链接导入所有子表，概览按表给出发现，有可靠关联键时可跨表计算。带 `table=tbl…` 的链接只导入指定子表。每张子表由 AVA 的 `feishu-bitable` 读取器加载，多表快照使用 AVA 的 SQLite 数据源。数据更新后重新发送链接可刷新快照。 [AVA 数据源文档](https://ava.antv.vision/documentation/data/sources/#feishu-bitable)
 
-每张子表由 AVA 原生 `feishu-bitable` 读取器加载。多表快照使用 AVA 的 SQLite 数据源，首次使用需要下载 DuckDB 官方 SQLite 扩展。机器人需要能读取参与分析的各张表。请复制原表地址，发布分享链接（`/share/base/`）需换成原表地址。表格变化后可重新发送链接刷新快照。普通飞书电子表格可导出为 XLSX/CSV 后发送。
+发布分享链接（`/share/base/`）需要换成原表地址。普通飞书电子表格可先导出为 XLSX 或 CSV 再上传。
+
+### 在群聊使用
+
+- 将机器人加入群，开通 `im:message.group_at_msg:readonly` 并发布。用飞书 API 调试台调用 `GET /open-apis/bot/v3/info`，把返回的 `bot.open_id` 填到 `.env` 的 `FEISHU_BOT_OPEN_ID`，然后重启。在群里 `@` 机器人提问或导入链接。
+- 要让机器人接收无法携带 `@` 的群文件消息，另外开通 `im:message.group_msg` 并发布。也可以在私聊上传文件。
+- 私聊与群聊各自保存数据和上下文。机器人在群聊中的回复对群成员可见。
+
+### 支持的文件
+
+| 格式 | 说明 |
+| --- | --- |
+| CSV、TSV | 第一行为表头，推荐 UTF-8 |
+| JSON、JSONL、NDJSON | JSON 推荐对象数组，JSONL 和 NDJSON 每行一个对象 |
+| XLSX | 支持多个工作表，旧 `.xls` 请先转换 |
+| Parquet | 保留文件中的字段类型 |
+| TXT、Markdown | 由模型抽取结构化数据，最多 256 KB，需 UTF-8 |
+| SQLite（`.sqlite`、`.sqlite3`、`.db`） | 只读加载数据库中的表 |
+
+Excel、SQLite 和多子表 Base 首次使用时，DuckDB 会下载对应的官方扩展。运行环境需要能访问扩展服务器，运行用户的主目录需要可写。
 
 ## 训练分类模型
 
-本地运行机器人时，先用 Python 3.11 或以上安装训练依赖。Docker 镜像已包含训练环境。
+本地运行时使用 Python **3.11 或以上**安装训练依赖。项目的 Dockerfile 已包含这一步。
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r ml/requirements.txt
 ```
 
-向机器人发送 CSV、Excel 或多维表格链接，然后用 `/训练 目标列`，也可在同一条消息里写「用这张表预测是否流失，试试随机森林」。目标名称应与列名一致。多个数据表有同名目标列时，使用 `/训练 "是否流失" --表 "客户"` 指定表。训练只使用一张表。
+发送含有真实结果标签的表格，再发 **`/训练 目标列`**。例如，客户表里有「是否流失」这一列，可以发送 `/训练 是否流失`。多个子表有同名目标列时，发送 `/训练 "是否流失" --表 "客户"`。训练使用一张表。
 
-机器人用 AVA 读取当前数据快照，在本地 Python 进程中比较多数类基线、逻辑回归和随机森林。结果卡显示分层交叉验证的宏平均 F1、平衡准确率、准确率，以及各类别的误判数量。每折独立完成缺失值填补和类别编码，相同特征的记录留在同一折。训练任务最多使用 5,000 行、80 个特征和 4 MB 数据。分类目标需有 2～8 个类别，至少 30 条有标签记录，每类至少 5 条。训练依赖可以通过 `ML_PYTHON` 指定其他 Python 路径。
+AVA 从当前快照读取训练数据，本地 Python 进程用 scikit-learn 比较多数类基线、逻辑回归和随机森林。评估卡显示分层交叉验证的宏平均 F1、平衡准确率、准确率和各类别误判。预处理在各训练折内完成，相同特征的记录留在同一折。当前功能用于训练与评估，训练结束后不会保存可供新数据预测的模型。这个流程不调用 DeepSeek。
 
-项目中的 `examples/titanic.csv` 可用 `/训练 Survived` 验证标签检查。它的标签与 Kaggle 按性别生成的示例预测一致，机器人会提示核对标签并停止训练。评估历史生还预测需要有可验证标签的训练集。
+单次训练最多 **5,000 行、80 个特征、4 MB**，目标列需有 **2～8 个类别**，至少有 **30 条已标注记录**，每类至少 **5 条**。可通过 `ML_PYTHON` 指定 Python 路径，默认优先用项目里的 `.venv/bin/python`。
 
-## 对话用法
+[titanic.csv](examples/titanic.csv)适合测试标签检查。它的 `Survived` 列与 Kaggle 按性别生成的示例预测一致，执行 `/训练 Survived` 会提示核对标签并停止训练。评估历史生还预测需要有可验证标签的数据。 [Kaggle 数据说明](https://www.kaggle.com/competitions/titanic/data)
 
-```text
-按地区汇总销售额，并画柱状图
-哪些产品利润率最低？请说明计算口径
-只看华东，再按月份比较
-按舱位和性别交叉分组，比较人数和票价中位数，并说明年龄缺失的影响
-/分析 不画图 列出销售额最高的前 10 条记录
-/字段
-/预览
-/画像
-/建议
-/清空
-```
+## 部署与运行
 
-`/状态` 显示当前文件和表信息；`/帮助` 查看用法。上传新文件成功后会替换本人的旧数据并清除追问上下文。导入失败会保留旧数据。Excel 多表可直接指定工作表名，例如 `关联“订单”和“客户”，按客户地区统计金额`。
+### Docker Compose
 
-私聊中也可以在同一条消息里附上一个文件并输入分析要求，例如「分析一下这个数据」+ `sales.csv`。机器人会先加载附件，再执行本条消息的分析要求。一次仅导入一个文件；多个工作表请放在同一个 XLSX 中。
-
-默认回复是一张分析卡，包含结论、最多两条关键依据和一个有针对性的下一步问题。适合可视化的结果会直接在卡片里显示：例如按月份比较用折线图，按地区比较用条形图。图表使用 AVA 实际算出的数值，不展示原始行、SQL 或附件清单。单个数值或没有足够可比数据时直接用文字回答。临时关闭图表可在问题前加「不画图」；全局关闭可配置 `ENABLE_CHARTS=false`。
-
-上传时带分析要求，只发送一条等待提示和一张分析卡；只上传文件时，提供简短的分析方向引导。卡片图表使用[飞书原生图表组件](https://open.feishu.cn/document/feishu-cards/card-json-v2-components/content-components/chart)，通过现有的消息回复接口发送。
-
-需要文件时再明确发送以下命令，每次只导出所选的一种文件：
-
-- `/导出 CSV`：下载上一次查询的结果数据（不带参数的 `/导出` 默认导出 CSV）。
-- `/导出 JSON`：下载上一次的分析结论和计算结果。
-- `/导出 图表`：为上一次结果生成图表 HTML；需要开启 `ENABLE_CHARTS`，打开 HTML 时需要联网加载 GPT-Vis。
-
-导出数据默认限制为 500 行和 512 KB，发生截断时结论卡会说明限制。普通对话不会自动生成或发送文件。字段、原始预览和数据画像仍可通过 `/字段`、`/预览`、`/画像` 按需查看。
-
-## 不连接飞书，单独验证模型和 AVA
-
-只需配置 `.env` 中的模型参数：
-
-```bash
-npm run analyze -- --file examples/sales.csv --prompt "按地区汇总销售额，并画柱状图"
-```
-
-结果保存到 `output/`。可用 `--no-chart` 关闭图表，或 `--out 路径` 指定目录。示例表的地区销售额应为：华东 **45000**、华南 **20000**、华北 **11000**。
-
-## Docker 部署
-
-填写 `.env` 并完成飞书应用配置后：
+配置好 `.env` 后运行以下命令，飞书事件订阅和发布流程与本地启动相同。
 
 ```bash
 docker compose up -d --build
 docker compose logs -f bot
 ```
 
-不需要映射端口。服务器需能访问飞书 HTTPS/WSS、模型 API 和 DuckDB 扩展服务。使用单实例运行；会话、队列和去重缓存在进程内，多个实例需要额外的共享会话与任务队列设计。
+容器使用 `/app/data` 保存会话临时文件。保持单实例运行，服务器需要能访问飞书 HTTPS/WSS、配置的模型 API 和 DuckDB 扩展服务器。会话、任务队列和去重记录保存在进程内。
 
-## 运行参数与数据生命周期
+### 常用配置
 
-完整参数见 [.env.example](.env.example)。默认最多 8 个数据会话，同时处理 2 个用户任务；每位用户最多积压 5 个任务，总队列上限 40。单文件上限 20 MB，闲置会话 60 分钟过期（每分钟清理一次），单次分析上限 180 秒。DuckDB 每个会话限制 256 MB 内存、1 个线程，单次 SQL 上限 30 秒。
+完整配置见 [.env.example](.env.example)。修改 `.env` 后重启服务。
 
-卡片图表直接使用本次计算结果。终端的 `analysis_charts_prepared` 记录准备好的图表数量；如果模型解读失败但已有计算结果，`analysis_summary_fallback` 表示卡片改用计算结果生成简短结论。
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `MAX_FILE_MB` | `20` | 上传文件大小上限 |
+| `MAX_SESSIONS` | `8` | 可同时保留的数据会话数 |
+| `SESSION_TTL_MINUTES` | `60` | 会话闲置有效期 |
+| `JOB_TIMEOUT_SECONDS` | `180` | 单个分析任务的超时设置，本地训练至多 120 秒 |
+| `MAX_RESULT_ROWS` | `500` | 分析结果行数上限，另有限制 512 KB |
+| `ENABLE_CHARTS` | `true` | 卡片图表和 HTML 图表导出 |
+| `LOG_USER_INPUT` | `true` | 在终端记录用户消息正文 |
+| `ALLOWED_USER_IDS` | 空 | 可选的用户 `open_id` 白名单，多个值用逗号分隔 |
 
-文件只写入服务自己的随机会话目录，正常清空、过期、替换或停机时删除。服务重启后需要重新上传。强制终止或机器断电可能留下 `data/run-*` 临时目录，可在服务停止后清理。群聊消息和已经发送至飞书的附件不随 `/清空` 撤回。
+同一用户的任务按发送顺序处理，默认同时处理 2 个任务。会话过期、清空或正常停机会清理临时数据，服务重启后需重新上传。意外退出留下的 `data/run-*` 临时目录可在服务停止后清理。
 
-可通过 `ALLOWED_USER_IDS` 配置允许使用的用户 open_id。密钥仅在服务端读取，日志不记录原始事件、模型请求或 SDK 错误对象。模型服务会接收问题、数据结构、查询结果和追问上下文；TXT/Markdown 抽取还会发送文本内容。请按你的数据使用要求选择模型服务。
+自然语言分析会把问题、数据结构、计算结果和追问上下文发送给配置的模型服务。TXT 和 Markdown 抽取也会发送文本内容。消息日志会遮盖链接和常见凭证，需要关闭正文时设置 `LOG_USER_INPUT=false`。
 
-## 验证
+## 排查问题
+
+| 现象 | 检查方式 |
+| --- | --- |
+| 私聊发消息没有回应 | 查看终端是否已连接，再检查 `im.message.receive_v1`、发布状态和应用可用范围 |
+| 收到消息但附件下载失败 | 核对应用身份的 `im:message:readonly`，日志里有 `requiredScopes` 时按实际缺项处理 |
+| 多维表格提示 `BITABLE_API_SCOPE` 或 `99991672` | 检查应用的 API 权限及新版本是否已发布 |
+| 多维表格提示 `BITABLE_ACCESS_DENIED` | 在原表给机器人添加文档应用权限，启用高级权限时核对目标子表 |
+| 回复「正在分析」后等待较久 | 按同一个 `request_id` 对照 `wait_ms`、`generate_sql`、`execute_sql` 和 `summarize` 的 `duration_ms` |
+| 训练提示 `ML_RUNTIME` | 安装 Python 训练依赖，或检查 `ML_PYTHON` 指向的解释器 |
+
+终端的 `message_received` 可以确认收到的文字和附件，`request_id` 可串起队列、分析或训练、飞书回复。`fields_served` 表示字段问题直接用了会话中已有的字段信息。`job_failed` 记录出错阶段、错误码和可用的诊断信息。
+
+## 本地验证
+
+只配置 `.env` 里的模型参数，就能用示例数据验证 AVA，无需飞书凭证。
+
+```bash
+npm run analyze -- --file examples/sales.csv --prompt "按地区汇总销售额"
+```
+
+结果默认保存在 `output/`，可用 `--out 路径` 指定目录，或用 `--no-chart` 跳过图表生成。开发时可运行 `npm run dev`，它会先编译一次，再监听编译产物。修改 TypeScript 后，在另一个终端执行 `npm run build` 即可触发重启。
 
 ```bash
 npm run check
 npm test
 ```
 
-测试运行真实 AVA/DuckDB，使用本地受控的 Chat Completions 接口验证统计、总结、连续追问及分析卡内图表，并通过飞书真实 SDK 配合模拟 HTTP 传输检查文件下载、multipart 上传和消息回复。不需要真实 API Key，不会向飞书发送消息。模型输出质量和飞书应用的实际授权，需填入真实配置后联调。
+测试使用真实 AVA/DuckDB 和模拟服务。安装 Python 训练依赖后，测试也会执行一次实际分类训练。测试不需要真实密钥。
 
-当前已通过 13 项自动测试，包含「文字 + 附件」直接分析、真实 HTTP 文件流经飞书 SDK 下载后由 AVA 读取、文件权限错误识别，并额外使用实际 XLSX 双工作表、Parquet 和 SQLite 文件验证读取与汇总。TypeScript 构建、CLI 帮助入口及 Compose 配置校验通过。本机 Docker daemon 未运行，尚未执行镜像构建或容器启动。
-
-运行 `npm start` 后，在同一终端查看日志。用 `request_id` 追踪一条消息，用 `session_id` 串起同一聊天中同一用户的多次请求。
-
-- `message_received` 记录收到的消息文字、附件数量和文件名。正文最多显示 1000 字符，链接、已配置的密钥和常见凭证会遮盖。可用 `LOG_USER_INPUT=false` 关闭正文。
-- `dataset_activated` 记录新旧文件名。`analysis_started` 和 `analysis_finished` 记录使用的数据、历史轮数、返回行数、图表数和耗时。`ava_stage_started` 和 `ava_stage_finished` 记录读取、查询和生成结论等阶段。
-- `training_data_requested` 记录选择的数据表和目标列。`training_data_ready` 记录准备耗时、行数和特征数。`training_finished` 记录验证折数、模型评分和训练耗时。
-- `reply_sent` 记录飞书回复成功，`job_failed` 记录失败阶段和错误码。
-
-## 代码入口
-
-| 文件 | 职责 |
-| --- | --- |
-| `src/main.ts` | 飞书长连接、启动与清理 |
-| `src/bot.ts` | 文件上传、聊天命令和回复流程 |
-| `src/analysis-worker.ts` | 调用 AVA source/profile/analyze/visualize |
-| `src/engine.ts` | 分析线程与超时终止 |
-| `src/sessions.ts` | 数据隔离、替换和过期清理 |
-| `src/feishu.ts` | 官方 SDK 文件和消息接口 |
-
-接口依据：[AVA 源码与数据源](https://github.com/antvis/AVA)、[飞书 Node SDK 长连接文档](https://github.com/larksuite/node-sdk/blob/main/README.zh.md)、[飞书消息权限说明](https://open.feishu.cn/document/develop-robots/add-bot-to-external-group)、[消息文件下载](https://open.feishu.cn/document/server-docs/im-v1/message-resource/get)。项目锁定 AVA 4.0.0；API 使用 `source()` / `analyze()`，与早期版本的加载方法不同。
-
-## 使用 DeepSeek API Key
-
-已预设 DeepSeek 官方接口。在本地 `.env` 中填写自己的 API Key：
-
-```dotenv
-LLM_API_KEY=你的DeepSeek_API_Key
-LLM_MODEL=deepseek-flash
-LLM_BASE_URL=https://api.deepseek.com
-```
-
-API Key 可在 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys) 创建。模型名与接口地址依据 [DeepSeek 官方接入文档](https://api-docs.deepseek.com/zh-cn/)；可将模型改为 `deepseek-v4-pro`。AVA 的 Chat Completions 接入代码无需修改。保存 `.env` 后重启机器人生效。
-
+[AVA 源码](https://github.com/antvis/AVA) · [飞书 Node SDK](https://github.com/larksuite/node-sdk/blob/main/README.zh.md)

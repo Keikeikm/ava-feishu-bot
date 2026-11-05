@@ -14,6 +14,10 @@ import { datasetCard, fieldsCard, helpCard, previewCard, profileCard, resultCard
 import { elapsedMs, inputLogFields, logEvent, requestLogContext } from './logging.js';
 import { isTrainingRequest, resolveTrainingRequest, trainClassifier, type TrainingInput } from './training.js';
 
+// Only match standalone schema questions, so questions that also request analysis keep using AVA.
+const fieldsQuestion = /^(?:(?:请(?:帮我)?|帮我)\s*)?(?:介绍(?:一下)?|列出|查看|看一下)\s*(?:这[份张]表(?:格)?(?:里|中)?(?:的)?|当前表(?:格)?(?:的)?|数据(?:表)?(?:的)?)?\s*(?:字段|列名)(?:\s*(?:分别)?(?:是什么|有哪些|有什么))?[。！？!?\s]*$/;
+const fieldsListQuestion = /^(?:(?:数据|表格)的?)?(?:字段(?:分别)?(?:是什么|有哪些)|有哪些字段)[。！？!?\s]*$/;
+
 export class Bot {
   private seen = new Deduplicator();
   private queue = new JobQueue();
@@ -106,9 +110,11 @@ export class Bot {
         await this.messenger.text(message, '已清空你的数据和追问记录，可以重新发送表格。');
         return;
       }
-      if (/^\/?(状态|字段|预览|画像)$/.test(text)) {
+      const lookup = fieldsQuestion.test(text) || fieldsListQuestion.test(text) ? '字段' : text.replace(/^\//, '');
+      if (/^(状态|字段|预览|画像)$/.test(lookup)) {
         const info = await this.sessions.info(message.sessionKey);
-        const factory = { 状态: datasetCard, 字段: fieldsCard, 预览: previewCard, 画像: profileCard }[text.replace(/^\//, '') as '状态'];
+        const factory = { 状态: datasetCard, 字段: fieldsCard, 预览: previewCard, 画像: profileCard }[lookup as '状态' | '字段' | '预览' | '画像'];
+        if (lookup === '字段') logEvent('fields_served', { file_name: info.name, tables: info.schema.models.length, source: 'session_metadata' });
         await this.messenger.card(message, factory(info));
         return;
       }
