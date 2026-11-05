@@ -1,16 +1,14 @@
-import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import type { AVA } from '@antv/ava';
 import { UserError } from './errors.js';
+import { runPython } from './python.js';
 import type { DatasetInfo } from './types.js';
 
 const trainingPrefix = /^(?:\/(?:训练|train)(?=\s|$)|(?:请)?(?:帮我)?(?:用(?:这张表|这份数据|当前表格|当前数据|随机森林|逻辑回归)(?:来)?)?(?:预测|训练(?:\s*(?:随机森林|逻辑回归)\s*预测)?))/i;
 const rowLimit = 5000;
 const featureLimit = 80;
-const root = new URL('../../', import.meta.url);
 
-export interface TrainingRequest { table: string; target: string }
+type TrainingTask = 'classification' | 'regression';
+export interface TrainingRequest { table: string; target: string; task: TrainingTask }
 interface TrainingColumn { name: string; kind: 'number' | 'category' }
 export interface TrainingInput extends TrainingRequest {
   dataset: string;
@@ -24,16 +22,64 @@ export interface ModelScore {
   balancedAccuracy: number;
   macroF1: number;
 }
-export interface TrainingReport {
+interface ValidationReport {
   rows: number;
   missingLabels: number;
   features: number;
   folds: number;
   grouped: boolean;
+}
+interface ClassificationReport extends ValidationReport {
+  task: 'classification';
   labels: string[];
   scores: ModelScore[];
   selected: 'logistic' | 'forest';
   confusion: number[][];
+}
+interface RegressionReport extends ValidationReport {
+  task: 'regression';
+  scores: { model: 'median' | 'ridge' | 'forest'; mae: number; rmse: number; r2: number }[];
+  selected: 'ridge' | 'forest';
+}
+export type TrainingReport = ClassificationReport | RegressionReport;
+export interface TrainingRun {
+  source: string;
+  target: string;
+  report: TrainingReport;
+  predictionRows?: number;
+}
+
+export const trainingModelNames = {
+  majority: '多数类基线', logistic: '逻辑回归', forest: '随机森林',
+  median: '中位数基线', ridge: '岭回归',
+};
+
+export function isTrainingModelQuestion(text: string): boolean {
+  if (/^\/(?:模型|model)[。！？!?\s]*$/i.test(text)) return true;
+  if (text.startsWith('/')) return false;
+  return /(?:用|选|比较|训练)[^。！？!?\n]{0,18}(?:什么|哪个|哪种|哪些)(?:机器学习)?(?:模型|算法)|(?:模型|算法)(?:是|用了|用的是)(?:什么|哪个|哪种|哪些)|模型[^。！？!?\n]{0,20}缓存[^。！？!?\n]{0,10}吗/.test(text);
+}
+
+export function trainingMetric(score: TrainingReport['scores'][number]): string {
+  return 'mae' in score ? `MAE ${score.mae.toPrecision(4)}` : `宏平均 F1 ${(score.macroF1 * 100).toFixed(1)}%`;
+}
+
+export function selectedTrainingModel(report: TrainingReport): string {
+  const estimator = report.selected === 'forest'
+    ? (report.task === 'classification' ? 'RandomForestClassifier' : 'RandomForestRegressor')
+    : report.selected === 'logistic' ? 'LogisticRegression' : 'Ridge';
+  return `${trainingModelNames[report.selected]}（${estimator}）`;
+}
+
+export function trainingSummary(run: TrainingRun): string {
+  const { source, target, report, predictionRows } = run;
+  const comparison = report.scores.map(score => `${trainingModelNames[score.model]} ${trainingMetric(score)}`).join('、');
+  const fitting = predictionRows === undefined ? '这轮只做了交叉验证评估。'
+    : `选定后，用全部 ${report.rows} 条有标签记录重新拟合，为 ${predictionRows} 条测试记录生成预测。`;
+  return `上一轮用 ${source} 训练，目标列为「${target}」。\n`
+    + `选定模型：${selectedTrainingModel(report)}。\n`
+    + `训练集 ${report.folds} 折交叉验证：${comparison}。\n`
+    + `${fitting}训练在本机运行；会话保留评估记录，拟合后的模型随训练进程结束释放。`;
 }
 
 export function isTrainingRequest(text: string): boolean {
@@ -45,21 +91,36 @@ export function resolveTrainingRequest(text: string, info: DatasetInfo): Trainin
   const input = text.replace(trainingPrefix, '').trim();
   const tableOption = /\s+--表\s+(?:"([^"]+)"|“([^”]+)”|(.+))$/u.exec(input);
   const table = tableOption && (tableOption[1] || tableOption[2] || tableOption[3])?.trim();
-  const goal = (tableOption ? input.slice(0, tableOption.index) : input).trim();
-  const quoted = /^(?:"([^"]+)"|“([^”]+)”|`([^`]+)`)/u.exec(goal);
-  const target = (quoted?.[1] || quoted?.[2] || quoted?.[3] || goal.split(/[，,。；;！!？?]/u, 1)[0] || '').trim();
+  const command = (tableOption ? input.slice(0, tableOption.index) : input).trim();
+  const regressionFlag = /(?:^|\s)--回归$/u;
+  const goal = command.replace(regressionFlag, '').trim();
+  const natural = !text.startsWith('/');
+  const explicitTarget = natural ? /(?:目标(?:字段|列|变量)|预测目标)\s*(?:是|为|[:：=])\s*/u.exec(goal) : null;
+  const targetText = explicitTarget ? goal.slice(explicitTarget.index + explicitTarget[0].length) : goal;
+  const quoted = /^(?:"([^"]+)"|“([^”]+)”|`([^`]+)`)/u.exec(targetText);
+  const target = (quoted?.[1] || quoted?.[2] || quoted?.[3] || targetText.split(/[，,。；;！!？?]/u, 1)[0] || '').trim();
+  const regression = regressionFlag.test(command) || (natural && /(?:回归任务|回归模型|做回归)/u.test(goal));
+  const task: TrainingTask = regression ? 'regression' : 'classification';
   const models = info.schema.models.filter(model => !table || model.name === table);
   if (!models.length) throw new UserError('找不到指定数据表。请用 /字段 查看表名和目标列。', 'ML_TARGET');
 
-  const candidates = models.flatMap(model => model.columns
-    .filter(column => column.name.toLowerCase() === target.toLowerCase()
-      || (/^(?:是否)?(?:生还|幸存|存活)$/.test(target) && column.name.toLowerCase() === 'survived'))
-    .map(column => ({ table: model.name, target: column.name })));
+  const columns = models.flatMap(model => model.columns.map(column => ({ table: model.name, target: column.name, task })));
+  let candidates = columns
+    .filter(column => column.target.toLowerCase() === target.toLowerCase()
+      || (/^(?:是否)?(?:生还|幸存|存活)$/.test(target) && column.target.toLowerCase() === 'survived'));
+  if (!candidates.length && explicitTarget && !quoted) {
+    // The field may be followed by a human-readable annotation, such as MEDV（房价中位数）.
+    const prefixes = columns.filter(column => target.toLowerCase().startsWith(column.target.toLowerCase())
+      && /^\s*[(（]/u.test(target.slice(column.target.length)));
+    const longest = Math.max(...prefixes.map(column => column.target.length));
+    candidates = prefixes.filter(column => column.target.length === longest);
+  }
   if (candidates.length === 1) return candidates[0]!;
   if (candidates.length > 1) {
-    throw new UserError(`多张表包含目标列「${target}」。请发送 /训练 "${target}" --表 "表名"。`, 'ML_TARGET');
+    const name = candidates[0]!.target;
+    throw new UserError(`多张表包含目标列「${name}」。请发送 /训练 "${name}"${task === 'regression' ? ' --回归' : ''} --表 "表名"。`, 'ML_TARGET');
   }
-  throw new UserError('请指定要预测的分类目标列，例如 /训练 Survived。目标列名称可通过 /字段 查看。', 'ML_TARGET');
+  throw new UserError('找不到要预测的目标列。请用 /字段 核对列名，再发送 /训练 目标列。回归任务可用 /训练 目标列 --回归。', 'ML_TARGET');
 }
 
 function trainingColumn(name: string, type: string): TrainingColumn | undefined {
@@ -94,45 +155,6 @@ export async function trainingSnapshot(ava: AVA, info: DatasetInfo, request: Tra
   };
 }
 
-export function trainClassifier(input: TrainingInput, timeoutMs: number, configuredPython?: string): Promise<TrainingReport> {
-  const venv = fileURLToPath(new URL('.venv/bin/python', root));
-  const python = configuredPython || (existsSync(venv) ? venv : 'python3');
-  const script = fileURLToPath(new URL('ml/train.py', root));
-  return new Promise((resolve, reject) => {
-    const child = spawn(python, [script], {
-      stdio: ['pipe', 'pipe', 'ignore'],
-      env: { PATH: process.env.PATH, OPENBLAS_NUM_THREADS: '1', OMP_NUM_THREADS: '1', MKL_NUM_THREADS: '1', VECLIB_MAXIMUM_THREADS: '1' },
-    });
-    let output = '';
-    let interrupted = false;
-    const timeout = setTimeout(() => {
-      interrupted = true;
-      child.kill('SIGKILL');
-    }, timeoutMs);
-    child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
-      if (output.length + chunk.length > 65_536) child.kill('SIGKILL');
-      else output += chunk;
-    });
-    const unavailable = () => new UserError('训练环境未就绪。请按 README 安装 Python 训练依赖。', 'ML_RUNTIME', 'training');
-    child.once('error', () => {
-      clearTimeout(timeout);
-      reject(unavailable());
-    });
-    child.once('close', code => {
-      clearTimeout(timeout);
-      if (interrupted) { reject(new UserError('训练超时，请缩小数据范围后重试。', 'ML_TIMEOUT', 'training')); return; }
-      if (code !== 0) { reject(new UserError('训练进程执行失败，请检查训练环境和数据类型。', 'ML_FAILED', 'training')); return; }
-      try {
-        const reply = JSON.parse(output) as { report?: TrainingReport; error?: { code: string; message: string } };
-        if (reply.error?.code === 'ML_RUNTIME') reject(unavailable());
-        else if (reply.error) reject(new UserError(reply.error.message, reply.error.code, 'training'));
-        else if (reply.report) resolve(reply.report);
-        else throw new Error('Missing training report');
-      } catch {
-        reject(new UserError('训练进程没有返回有效的评估报告。', 'ML_FAILED', 'training'));
-      }
-    });
-    child.stdin.on('error', () => { /* Process exit reports startup and training errors. */ });
-    child.stdin.end(JSON.stringify(input));
-  });
+export function trainModel(input: TrainingInput, timeoutMs: number, configuredPython?: string): Promise<TrainingReport> {
+  return runPython('train', input, timeoutMs, configuredPython);
 }

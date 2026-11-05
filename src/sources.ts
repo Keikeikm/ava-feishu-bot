@@ -5,14 +5,16 @@ import type { DatasetSource } from './types.js';
 import { UserError } from './errors.js';
 
 export const SUPPORTED_FILES = 'CSV / TSV / JSON / JSONL / NDJSON / XLSX / Parquet / TXT / Markdown / SQLite';
-const extensions = new Set(['.csv', '.tsv', '.json', '.jsonl', '.ndjson', '.xlsx', '.parquet', '.txt', '.md', '.sqlite', '.sqlite3', '.db']);
+export const dataExtensions = ['.csv', '.tsv', '.json', '.jsonl', '.ndjson', '.xlsx', '.parquet', '.txt', '.md', '.sqlite', '.sqlite3', '.db'];
+const extensions = new Set(dataExtensions);
 const feishuHost = /^(?:[a-z0-9-]+\.)?feishu\.cn$/i;
 const bitablePath = /^\/(?:base|wiki|share\/base)\//;
 
-export function fileExtension(name: string): string {
+export function fileExtension(name: string, allowZip = false): string {
   const ext = extname(name).toLowerCase();
+  if (allowZip && ext === '.zip') return ext;
   if (ext === '.xls') throw new UserError('AVA 的 Excel 接口支持 .xlsx，请先将旧版 .xls 另存为 .xlsx 或 CSV。');
-  if (!extensions.has(ext)) throw new UserError(`不支持此文件类型。请发送：${SUPPORTED_FILES}。`);
+  if (!extensions.has(ext)) throw new UserError(`不支持此文件类型。请发送：${SUPPORTED_FILES}${allowZip ? ' / ZIP' : ''}。`);
   return ext;
 }
 

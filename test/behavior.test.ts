@@ -16,6 +16,18 @@ import { resultCard } from '../src/cards.js';
 import type { DatasetInfo } from '../src/types.js';
 import { inputLogFields } from '../src/logging.js';
 import type { InlineChart } from '../src/charts.js';
+import { mentionedArchiveFiles } from '../src/archive.js';
+
+test('ZIP 自然语言选文件支持路径、重名提示和文件名边界', () => {
+  const files = ['data/train.csv', 'other/train.csv', 'test.csv'].map(entry => ({
+    entry, name: entry.split('/').at(-1)!, path: '',
+  }));
+  assert.deepEqual(mentionedArchiveFiles(files, '请分析「DATA/TRAIN.CSV」的分布。'), [0]);
+  assert.deepEqual(mentionedArchiveFiles(files, '分析train.csv的数据'), [0, 1]);
+  assert.deepEqual(mentionedArchiveFiles(files, '分析data/train.csv和test.csv。'), [0, 2]);
+  assert.deepEqual(mentionedArchiveFiles(files, '分析test.csv. 然后检查缺失值'), [2]);
+  assert.deepEqual(mentionedArchiveFiles(files, '分析pretest.csv、test.csv.bak 和 unknown/test.csv'), []);
+});
 
 test('分析卡用普通文字展示标题，图中去掉浮点尾数并保留小量级数值', () => {
   const forecast: InlineChart = {

@@ -12,7 +12,8 @@ import { bitableRequest, fileExtension } from './sources.js';
 import { UserError, publicFailure } from './errors.js';
 import { datasetCard, fieldsCard, helpCard, previewCard, profileCard, resultCard, resultCsv, trainingCard } from './cards.js';
 import { elapsedMs, inputLogFields, logEvent, requestLogContext } from './logging.js';
-import { isTrainingRequest, resolveTrainingRequest, trainClassifier, type TrainingInput } from './training.js';
+import { isTrainingModelQuestion, isTrainingRequest, resolveTrainingRequest, selectedTrainingModel, trainingMetric, trainingSummary, trainModel, type TrainingInput } from './training.js';
+import { archiveGuide, compareSubmission, comparisonFile, isArchivePrediction, isSubmissionComparison, mentionedArchiveFiles, openArchive, predictArchive } from './archive.js';
 
 // Only match standalone schema questions, so questions that also request analysis keep using AVA.
 const fieldsQuestion = /^(?:(?:请(?:帮我)?|帮我)\s*)?(?:介绍(?:一下)?|列出|查看|看一下)\s*(?:这[份张]表(?:格)?(?:里|中)?(?:的)?|当前表(?:格)?(?:的)?|数据(?:表)?(?:的)?)?\s*(?:字段|列名)(?:\s*(?:分别)?(?:是什么|有哪些|有什么))?[。！？!?\s]*$/;
@@ -21,7 +22,8 @@ const fieldsListQuestion = /^(?:(?:数据|表格)的?)?(?:字段(?:分别)?(?:�
 export class Bot {
   private seen = new Deduplicator();
   private queue = new JobQueue();
-  constructor(private config: Config, private runtimeDir: string, private messenger: Messenger, private sessions: Pick<Sessions, 'replace' | 'info' | 'run' | 'clear' | 'close'>) {}
+  constructor(private config: Config, private runtimeDir: string, private messenger: Messenger,
+    private sessions: Pick<Sessions, 'replace' | 'replaceArchive' | 'archive' | 'useArchive' | 'selectArchiveFile' | 'recordTraining' | 'latestTraining' | 'info' | 'run' | 'clear' | 'close'>) {}
 
   // Intentionally synchronous: the Feishu event handler can ACK within 3 seconds.
   accept(event: MessageEvent): void {
@@ -56,19 +58,61 @@ export class Bot {
     try {
       const bitable = bitableRequest(message.text || '');
       if (bitable && message.file) throw new UserError('请在一条消息里选择一个数据来源：表格附件或多维表格链接。');
+      if (!bitable && !message.file && isTrainingModelQuestion(message.text ?? '')) {
+        const run = this.sessions.latestTraining(message.sessionKey);
+        await this.messenger.text(message, run ? trainingSummary(run) : '当前数据会话还没有训练记录。完成一次训练后，可以发送 /模型 查看。');
+        return;
+      }
+      const comparison = isSubmissionComparison(message.text ?? '');
+      const comparisonCommand = /^\/(?:对比|评估)(?:\s|$)/.test(message.text ?? '');
+      if (!bitable && comparison && (comparisonCommand || this.sessions.archive(message.sessionKey))
+          && (!message.file || !/\.zip$/i.test(message.file.name))) {
+        await this.sessions.useArchive(message.sessionKey, async ({ source, submission }) => {
+          if (!submission) throw new UserError('当前 ZIP 会话还没有预测结果。请先发送 /预测，再对比参考文件。', 'ML_NO_SUBMISSION');
+          const started = performance.now();
+          let result: string;
+          if (message.file) {
+            if ((message.attachmentCount ?? 1) !== 1 || !/\.csv$/i.test(message.file.name)) {
+              throw new UserError('请一次发送一个用于对比的 CSV 附件。', 'ML_REFERENCE');
+            }
+            const directory = await mkdtemp(join(this.runtimeDir, 'comparison-'));
+            try {
+              const path = join(directory, 'reference.csv');
+              await this.messenger.download(message, path);
+              result = await compareSubmission(submission, { name: message.file.name, path }, this.config);
+            } finally { await rm(directory, { recursive: true, force: true }); }
+          } else {
+            const reference = comparisonFile(source, message.text!);
+            result = await compareSubmission(submission, reference, this.config);
+          }
+          logEvent('submission_compared', { file_name: source.name, target: submission.target, duration_ms: elapsedMs(started) });
+          await this.messenger.text(message, result);
+        });
+        return;
+      }
       if (message.file) {
         if ((message.attachmentCount || 1) > 1) throw new UserError('请一次发送一个表格文件。需要分析多张表时，可放在同一个 XLSX 的不同工作表中。');
         if (message.file.name === '未命名文件') throw new UserError('没有读取到附件文件名，请将表格作为单独的文件消息重新发送。');
-        const extension = fileExtension(message.file.name);
-        await this.messenger.text(message, message.text ? '正在读取表格并分析，请稍候。' : '正在读取表格，请稍候。');
+        const extension = fileExtension(message.file.name, true);
+        await this.messenger.text(message, extension === '.zip' ? '正在解压 ZIP 并检查数据文件，请稍候。'
+          : message.text ? '正在读取表格并分析，请稍候。' : '正在读取表格，请稍候。');
         const directory = await mkdtemp(join(this.runtimeDir, 'session-'));
         let imported = false;
         try {
           const path = join(directory, `input${extension}`);
           await this.messenger.download(message, path);
-          const info = await this.sessions.replace(message.sessionKey, { kind: 'file', path, name: message.file.name }, directory);
-          imported = true;
-          if (!message.text) await this.messenger.card(message, datasetCard(info));
+          if (extension === '.zip') {
+            const archive = await openArchive(message.file.name, path, this.config);
+            await rm(path);
+            await this.sessions.replaceArchive(message.sessionKey, archive, directory);
+            imported = true;
+            logEvent('archive_opened', { file_name: archive.name, files: archive.files.length });
+            if (!message.text) await this.messenger.text(message, archiveGuide(archive));
+          } else {
+            const info = await this.sessions.replace(message.sessionKey, { kind: 'file', path, name: message.file.name }, directory);
+            imported = true;
+            if (!message.text) await this.messenger.card(message, datasetCard(info));
+          }
         } catch (error) {
           if (!imported) await rm(directory, { recursive: true, force: true });
           throw error;
@@ -83,23 +127,82 @@ export class Bot {
         const info = await this.sessions.replace(message.sessionKey, { kind: 'bitable', url: bitable.url, name: '飞书多维表格', appId: this.config.appId, appSecret: this.config.appSecret }, directory);
         if (!bitable.question) { await this.messenger.card(message, datasetCard(info)); return; }
       }
-      const text = bitable?.question ?? message.text ?? '';
+      let text = bitable?.question ?? message.text ?? '';
+      const archive = this.sessions.archive(message.sessionKey);
+      if (archive && comparison) throw new UserError('请先为当前 ZIP 发送 /预测，再对比参考文件。', 'ML_NO_SUBMISSION');
+      if (archive && isArchivePrediction(text)) {
+        await this.sessions.useArchive(message.sessionKey, async state => {
+          const { source } = state;
+          await this.messenger.text(message, '正在用训练集交叉验证模型，并为测试集生成提交文件，请稍候。');
+          const started = performance.now();
+          logEvent('submission_started', { file_name: source.name });
+          const result = await predictArchive(source, text, this.config);
+          logEvent('submission_finished', { file_name: source.name, target: result.target, task: result.report.task,
+            model: result.report.selected, train_rows: result.report.rows, test_rows: result.rows, duration_ms: elapsedMs(started) });
+          const best = result.report.scores.find(score => score.model === result.report.selected)!;
+          const metric = trainingMetric(best);
+          await this.messenger.file(message, 'submission.csv', Buffer.from(result.csv, 'utf8'));
+          state.submission = { csv: result.csv, target: result.target, task: result.report.task, template: result.template };
+          this.sessions.recordTraining(message.sessionKey, {
+            source: `${source.name} / train.csv`, target: result.target, report: result.report, predictionRows: result.rows,
+          });
+          await this.messenger.text(message, `本轮在本机训练，选定 ${selectedTrainingModel(result.report)}，用全部 ${result.report.rows} 条有标签记录重新拟合，为测试集生成 ${result.rows} 条「${result.target}」预测并写入 submission.csv。\n训练集 ${result.report.folds} 折交叉验证结果：${metric}。发送 /模型 可查看各模型的分数。`);
+        });
+        return;
+      }
+      if (archive && /^\/?状态$/.test(text)) {
+        await this.sessions.useArchive(message.sessionKey, async ({ source }) => {
+          await this.messenger.text(message, archiveGuide(source, archive.selected));
+        });
+        return;
+      }
+      const selection = /^\/选文件\s+(\d+)$/.exec(text);
+      if (selection) {
+        const info = await this.sessions.selectArchiveFile(message.sessionKey, Number(selection[1]) - 1);
+        await this.messenger.card(message, datasetCard(info));
+        return;
+      }
+      if (/^\/(?:预测|predict)(?:\s|$)/i.test(text)) throw new UserError('请先上传包含训练集、测试集和提交模板的 ZIP。', 'ZIP_REQUIRED');
+      if (archive && !/^(?:\/?(?:清空|帮助|help)|你好|您好|hello|hi|嗨|在吗)[!！?？。\s]*$/i.test(text)) {
+        const question = text.replace(/^\/?分析\s+/, '');
+        const files = archive.source.files;
+        const matches = !text.startsWith('/') || /^\/分析(?:\s|$)/.test(text) ? mentionedArchiveFiles(files, question) : [];
+        if (matches.length > 1) {
+          const choices = matches.map(index => `${index + 1}. ${files[index]!.entry}`).join('\n');
+          throw new UserError(`这句话匹配到多个文件。请用 /选文件 加编号选择其中一个，也可以在问题中写完整路径。\n${choices}`, 'ZIP_SELECT', 'source');
+        }
+        if (matches[0] !== undefined) {
+          const index = matches[0];
+          const file = files[index]!;
+          const info = await this.sessions.selectArchiveFile(message.sessionKey, index);
+          const prefix = [file.entry, file.name].find(name =>
+            question.toLowerCase().startsWith(name.toLowerCase()) && /^(?:\s|$)/u.test(question.slice(name.length)));
+          const query = prefix ? question.slice(prefix.length).trim() : question;
+          if (!query) { await this.messenger.card(message, datasetCard(info)); return; }
+          text = `/分析 ${query}`;
+        } else if (archive.selected === undefined) {
+          if (archive.source.files.length === 1) await this.sessions.selectArchiveFile(message.sessionKey, 0);
+          else { await this.messenger.text(message, archiveGuide(archive.source)); return; }
+        }
+      }
       if (isTrainingRequest(text)) {
         const info = await this.sessions.info(message.sessionKey);
         const training = resolveTrainingRequest(text, info);
-        const dataset = { file_name: info.name, table: training.table, target: training.target };
+        const dataset = { file_name: info.name, table: training.table, target: training.target, task: training.task };
         const prepStartedAt = performance.now();
         logEvent('training_data_requested', dataset);
         const input = await this.sessions.run<TrainingInput>(message.sessionKey, 'training-data', { training });
         logEvent('training_data_ready', { rows: input.rows.length, features: input.columns.length, excluded_features: input.excluded.length, duration_ms: elapsedMs(prepStartedAt) });
-        await this.messenger.text(message, '正在训练分类模型并做交叉验证，请稍候。');
+        const regression = training.task === 'regression';
+        await this.messenger.text(message, `正在训练${regression ? '回归' : '分类'}模型并做交叉验证，请稍候。`);
         const trainingStartedAt = performance.now();
-        logEvent('training_started', { ...dataset, runtime: 'local_python', models: ['majority', 'logistic', 'forest'] });
-        const report = await trainClassifier(input, Math.min(this.config.jobTimeoutMs, 120_000), this.config.mlPython);
+        logEvent('training_started', { ...dataset, runtime: 'local_python', models: regression ? ['median', 'ridge', 'forest'] : ['majority', 'logistic', 'forest'] });
+        const report = await trainModel(input, Math.min(this.config.jobTimeoutMs, 120_000), this.config.mlPython);
         logEvent('training_finished', {
-          model: report.selected, rows: report.rows, missing_labels: report.missingLabels, features: report.features,
+          task: report.task, model: report.selected, rows: report.rows, missing_labels: report.missingLabels, features: report.features,
           folds: report.folds, grouped: report.grouped, scores: report.scores, duration_ms: elapsedMs(trainingStartedAt),
         });
+        this.sessions.recordTraining(message.sessionKey, { source: `${input.dataset} / ${input.table}`, target: input.target, report });
         await this.messenger.card(message, trainingCard(input, report, this.config.enableCharts));
         return;
       }

@@ -33,14 +33,14 @@ function event(id: string, text: string, user = 'ou_user'): MessageEvent {
   return { sender: { sender_type: 'user', sender_id: { open_id: user } }, message: { message_id: id, chat_id: 'oc_chat', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }) } };
 }
 
-test('飞书训练指令读取当前 AVA 数据并生成评估卡，拦截泰坦尼克号示例标签', { timeout: 60_000 }, async t => {
+test('飞书训练指令读取当前 AVA 数据并评估分类和回归，拦截泰坦尼克号示例标签', { timeout: 60_000 }, async t => {
   const python = process.env.ML_PYTHON || (existsSync('.venv/bin/python') ? resolve('.venv/bin/python') : 'python3');
   if (spawnSync(python, ['-c', "import importlib.util; raise SystemExit(importlib.util.find_spec('sklearn') is None)"], { stdio: 'ignore' }).status !== 0) {
     t.skip('需要安装 ml/requirements.txt');
     return;
   }
   const config = loadConfig({ FEISHU_APP_ID: 'test', FEISHU_APP_SECRET: 'test', LLM_API_KEY: 'test', LLM_MODEL: 'test', ML_PYTHON: python });
-  const logs: { event: string; request_id: string; input_text?: string; target?: string; runtime?: string; scores?: unknown[] }[] = [];
+  const logs: { event: string; request_id: string; input_text?: string; target?: string; task?: string; runtime?: string; scores?: unknown[] }[] = [];
   t.mock.method(console, 'info', (entry: string) => {
     if (typeof entry === 'string' && entry.startsWith('{')) logs.push(JSON.parse(entry));
   });
@@ -53,12 +53,20 @@ test('飞书训练指令读取当前 AVA 数据并生成评估卡，拦截泰坦
     const label = i % 17 === 0 ? '' : Number(usage < (channel === '线上' ? 32 : 48));
     fixture.push(`${i},${usage},${channel},${label}`);
   }
+  const housing = ['RM,LSTAT,MEDV'];
+  for (let i = 0; i < 120; i++) {
+    const rooms = 4 + i % 60 / 20;
+    const share = 5 + (i % 60 * 13) % 23;
+    const price = i % 19 === 0 ? '' : (4.5 * rooms - 0.35 * share + i % 4 / 10).toFixed(2);
+    housing.push(`${rooms},${share},${price}`);
+  }
   const messenger: Messenger = {
     text: async (m, content) => { sent.push({ id: m.id, kind: 'text', content }); },
     card: async (m, content) => { sent.push({ id: m.id, kind: 'card', content: JSON.stringify(content) }); },
     file: async () => { assert.fail('训练结果应直接在卡片里显示'); },
     download: async (m, path) => {
       if (m.file?.name === 'titanic.csv') await copyFile(resolve('examples/titanic.csv'), path);
+      else if (m.file?.name === 'housing.csv') await writeFile(path, housing.join('\n'));
       else await writeFile(path, fixture.join('\n'));
     },
   };
@@ -74,7 +82,20 @@ test('飞书训练指令读取当前 AVA 数据并生成评估卡，拦截泰坦
       bot.accept(message);
     };
     upload('train', 'customers.csv', '用这张表预测流失，试试随机森林');
+    bot.accept(event('invalid-regression', '/训练 渠道 --回归'));
     upload('unverified', 'titanic.csv', '/训练 Survived');
+    upload('housing', 'housing.csv', '');
+    await waitFor(() => sent.some(item => item.id === 'housing' && item.kind === 'card'));
+    const regressionRequest = '请帮我训练一个机器学习模型。目标字段是 MEDV（自住房屋中位数价值）。这是一个回归任务。';
+    const richText = event('regression', '');
+    const [beforeTarget, afterTarget] = regressionRequest.split('MEDV');
+    richText.message.message_type = 'post';
+    richText.message.content = JSON.stringify({
+      content: [[{ tag: 'text', text: beforeTarget }, { tag: 'text', text: 'MEDV', style: ['bold'] }, { tag: 'text', text: afterTarget }]],
+    });
+    bot.accept(richText);
+    bot.accept(event('regression-command', '/训练 "medv" --回归 --表 "data"'));
+    bot.accept(event('regression-model', '/模型'));
     await bot.close();
     const trained = sent.find(item => item.id === 'train' && item.kind === 'card');
     assert.ok(trained, JSON.stringify(sent));
@@ -90,13 +111,112 @@ test('飞书训练指令读取当前 AVA 数据并生成评估卡，拦截泰坦
     assert.equal(trainingLogs.find(log => log.event === 'training_finished')?.scores?.length, 3);
     assert.ok(sent.some(item => item.id === 'unverified' && item.content.includes('ML_UNVERIFIED_LABEL')));
     assert.ok(!sent.some(item => item.id === 'unverified' && item.kind === 'card'));
+    const regression = sent.find(item => item.id === 'regression' && item.kind === 'card');
+    assert.ok(regression, JSON.stringify(sent.filter(item => item.id === 'regression')));
+    assert.match(regression.content, /回归模型评估/);
+    assert.match(regression.content, /预测「MEDV」/);
+    assert.match(regression.content, /中位数基线 · MAE [\d.]+ · RMSE [\d.]+ · R² -?[\d.]+/);
+    assert.match(regression.content, /排除了 7 条缺少目标标签/);
+    assert.match(regression.content, /相同特征的记录留在同一折/);
+    const regressionChart = JSON.parse(regression.content).body.elements.find((element: { tag: string }) => element.tag === 'chart');
+    assert.equal(regressionChart.chart_spec.data.values.length, 3);
+    const regressionLog = logs.find(log => log.event === 'message_received' && log.input_text === regressionRequest);
+    assert.ok(regressionLog);
+    assert.ok(logs.some(log => log.request_id === regressionLog.request_id && log.event === 'training_started'
+      && log.task === 'regression' && log.target === 'MEDV' && log.runtime === 'local_python'));
+    assert.ok(sent.some(item => item.id === 'regression-command' && item.kind === 'card' && item.content.includes('回归模型评估')));
+    assert.ok(sent.some(item => item.id === 'regression-model' && item.kind === 'text'
+      && /选定模型：(?:岭回归（Ridge）|随机森林（RandomForestRegressor）)/.test(item.content)
+      && item.content.includes('这轮只做了交叉验证评估')));
+    assert.ok(sent.some(item => item.id === 'invalid-regression' && item.kind === 'text'
+      && item.content.includes('回归目标列需要是数值') && item.content.includes('ML_LABELS')));
   } finally {
     await bot.close();
     await rm(runtime, { recursive: true, force: true });
   }
 });
 
-test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图表、去重及不同用户隔离', { timeout: 60_000 }, async () => {
+test('ZIP 上传后询问用途，按 ID 生成和对比预测，拒绝越界路径', { timeout: 60_000 }, async t => {
+  const python = process.env.ML_PYTHON || (existsSync('.venv/bin/python') ? resolve('.venv/bin/python') : 'python3');
+  if (spawnSync(python, ['-c', "import importlib.util; raise SystemExit(importlib.util.find_spec('sklearn') is None)"], { stdio: 'ignore' }).status !== 0) {
+    t.skip('需要安装 ml/requirements.txt');
+    return;
+  }
+  const config = loadConfig({ FEISHU_APP_ID: 'test', FEISHU_APP_SECRET: 'test', LLM_API_KEY: 'test', LLM_MODEL: 'test', ML_PYTHON: python });
+  const runtime = await mkdtemp(join(tmpdir(), 'ava-zip-e2e-'));
+  const files = new Map<string, { name: string; content: string }>();
+  const sent: { id: string; content: string }[] = [];
+  const bot = new Bot(config, runtime, {
+    text: async (m, content) => { sent.push({ id: m.id, content }); },
+    card: async (m, card) => { sent.push({ id: m.id, content: JSON.stringify(card) }); },
+    file: async (m, name, data) => { files.set(m.id, { name, content: data.toString('utf8') }); },
+    download: async (m, path) => { await copyFile(join(runtime, m.file!.name), path); },
+  }, new Sessions(config));
+  try {
+    const generated = spawnSync(python, ['-c', `
+from pathlib import Path
+import sys, zipfile
+root = Path(sys.argv[1])
+with zipfile.ZipFile(root / "challenge.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("challenge/train.csv", "Id,Age,Survived\\n" + "".join(f"{i},{i},{int(i >= 60)}\\n" for i in range(120)))
+    archive.writestr("challenge/test.csv", "Id,Age\\n00123,3\\n00124,117\\n")
+    archive.writestr("challenge/gender_submission.csv", "Survived,Id\\n0,00124\\n1,00123\\n")
+    archive.writestr("__MACOSX/._train.csv", "ignore")
+with zipfile.ZipFile(root / "unsafe.zip", "w") as archive:
+    archive.writestr("../outside.csv", "a,b\\n1,2\\n")
+`, runtime], { encoding: 'utf8' });
+    assert.equal(generated.status, 0, generated.stderr);
+    const upload = (id: string, file: string, question = '') => {
+      const message = event(id, '');
+      message.message.message_type = question ? 'post' : 'file';
+      const attachment = { file_key: 'fixture', file_name: file };
+      message.message.content = JSON.stringify(question ? { content: [[{ tag: 'text', text: question }]], files: [attachment] } : attachment);
+      bot.accept(message);
+    };
+    upload('zip', 'challenge.zip');
+    await waitFor(() => sent.some(item => item.id === 'zip' && item.content.includes('你想分析哪个文件')));
+    const guide = sent.find(item => item.id === 'zip' && item.content.includes('你想分析哪个文件'))!.content;
+    assert.match(guide, /challenge\/train.csv[\s\S]*challenge\/test.csv[\s\S]*gender_submission.csv/);
+    assert.doesNotMatch(guide, /__MACOSX/);
+    assert.equal(files.size, 0);
+    bot.accept(event('select', '/选文件 1'));
+    upload('unsafe', 'unsafe.zip');
+    bot.accept(event('predict', '请用机器学习预测'));
+    upload('with-prompt', 'challenge.zip', '/预测 --目标 Survived --分类');
+    await waitFor(() => files.has('with-prompt'));
+    bot.accept(event('model-question', '你刚才用什么模型训练的？'));
+    await waitFor(() => sent.some(item => item.id === 'model-question'));
+    bot.accept(event('compare-template', '请你检验一下你预测的正确率。答案在gender_submission.csv'));
+    bot.accept(event('compare-unlabeled', '/对比 test.csv'));
+    await writeFile(join(runtime, 'labels.csv'), 'Id,Survived\n00123,0\n00124,0\n');
+    upload('compare-labels', 'labels.csv', '/对比');
+    await writeFile(join(runtime, 'wrong-ids.csv'), 'Id,Survived\n00123,0\n00125,0\n');
+    upload('compare-wrong-ids', 'wrong-ids.csv', '/对比');
+    await bot.close();
+    assert.ok(sent.some(item => item.id === 'select' && item.content.includes('train.csv')));
+    assert.ok(sent.some(item => item.id === 'unsafe' && item.content.includes('ZIP_INVALID')));
+    assert.ok(sent.some(item => item.id === 'predict' && /训练集 \d+ 折交叉验证结果：宏平均 F1/.test(item.content)));
+    const predictionReply = sent.find(item => item.id === 'with-prompt' && item.content.includes('本轮在本机训练'));
+    assert.ok(predictionReply);
+    const estimator = /选定 ((?:逻辑回归（LogisticRegression）|随机森林（RandomForestClassifier）))/.exec(predictionReply.content)?.[1];
+    assert.ok(estimator);
+    assert.deepEqual(sent.filter(item => item.id === 'model-question').map(item => item.content.includes(`选定模型：${estimator}`)), [true]);
+    assert.ok(sent.some(item => item.id === 'model-question' && item.content.includes('用全部 120 条有标签记录重新拟合，为 2 条测试记录')));
+    for (const id of ['predict', 'with-prompt']) {
+      assert.deepEqual(files.get(id), { name: 'submission.csv', content: 'Survived,Id\r\n1,00124\r\n0,00123\r\n' }, JSON.stringify(sent.filter(item => item.id === id)));
+    }
+    assert.equal(files.size, 2);
+    assert.ok(sent.some(item => item.id === 'compare-template' && item.content.includes('一致率 0.00%') && item.content.includes('提交示例')));
+    assert.ok(sent.some(item => item.id === 'compare-labels' && item.content.includes('按所提供标签计算的准确率 50.00%')));
+    assert.ok(sent.some(item => item.id === 'compare-unlabeled' && item.content.includes('缺少目标列「Survived」')));
+    assert.ok(sent.some(item => item.id === 'compare-wrong-ids' && item.content.includes('匹配 1 条')));
+  } finally {
+    await bot.close();
+    await rm(runtime, { recursive: true, force: true });
+  }
+});
+
+test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图表、去重及不同用户隔离', { timeout: 60_000 }, async t => {
   const prompts: string[] = [];
   let breakChart = false;
   const server = createServer(async (req, res) => {
@@ -140,7 +260,9 @@ test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图�
     text: async (m, text) => { sent.push({ id: m.id, kind: 'text', data: text }); },
     card: async (m, card) => { sent.push({ id: m.id, kind: 'card', data: card }); },
     file: async (m, name, data) => { sent.push({ id: m.id, kind: name, data: data.toString('utf8') }); },
-    download: async (_m, destination) => { await copyFile(resolve('examples/sales.csv'), destination); },
+    download: async (m, destination) => {
+      await copyFile(m.file?.name === 'eda.zip' ? join(runtime, 'eda.zip') : resolve('examples/sales.csv'), destination);
+    },
   };
   const bot = new Bot(config, runtime, messenger, sessions);
   try {
@@ -181,6 +303,37 @@ test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图�
       { tag: 'text', text: '分析一下' },
     ]] });
     bot.accept(shared);
+    await t.test('在自然语言中指定 ZIP 文件并做探索性分析', async t => {
+      const python = process.env.ML_PYTHON || (existsSync('.venv/bin/python') ? resolve('.venv/bin/python') : 'python3');
+      const generated = spawnSync(python, ['-c', `
+from zipfile import ZipFile
+import sys
+with ZipFile(sys.argv[1], 'w') as archive:
+    archive.write('examples/sales.csv', 'data/train.csv')
+    archive.writestr('test.csv', 'Id,Age\\n1,24\\n')
+`, join(runtime, 'eda.zip')], { encoding: 'utf8' });
+      if ((generated.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+        t.skip('ZIP 解压需要 Python 3');
+        return;
+      }
+      assert.equal(generated.status, 0, generated.stderr);
+      const user = 'ou_zip';
+      const upload = event('upload-eda', '', user);
+      upload.message.message_type = 'file';
+      upload.message.content = JSON.stringify({ file_key: 'zip_eda', file_name: 'eda.zip' });
+      bot.accept(upload);
+      const question = '请你帮我对train.csv进行数据探索性分析？';
+      bot.accept(event('zip-eda', question, user));
+      await waitFor(() => sent.some(reply => reply.id === 'zip-eda' && reply.kind === 'card'));
+      const result = sent.find(reply => reply.id === 'zip-eda' && reply.kind === 'card');
+      assert.match(JSON.stringify(result?.data), /华东.*45000/);
+      assert.ok(prompts.some(prompt => prompt.includes(`当前问题：${question}`) && prompt.includes('关键字段的缺失')));
+      bot.accept(event('zip-compare-groups', '请对比train.csv中各地区的销售额', user));
+      await waitFor(() => sent.some(reply => reply.id === 'zip-compare-groups' && reply.kind === 'card'));
+      bot.accept(event('zip-ambiguous', '对train.csv和test.csv进行探索性分析', user));
+      await waitFor(() => sent.some(reply => reply.id === 'zip-ambiguous' && String(reply.data).includes('匹配到多个文件')));
+      assert.equal(sent.some(reply => reply.id === 'zip-ambiguous' && reply.kind === 'card'), false);
+    });
     await bot.close();
     assert.deepEqual(bitableImports, ['https://demo.feishu.cn/base/ABC?table=tbl123']);
     const bitableReplies = sent.filter(s => s.id === shared.message.message_id);

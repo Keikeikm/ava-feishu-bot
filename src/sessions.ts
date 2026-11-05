@@ -4,10 +4,17 @@ import type { DatasetInfo, DatasetSource } from './types.js';
 import { EngineClient } from './engine.js';
 import { UserError } from './errors.js';
 import { logEvent, requestLogContext } from './logging.js';
+import type { Archive, SavedSubmission } from './archive.js';
+import type { TrainingRun } from './training.js';
+
+interface ArchiveSession { source: Archive; submission?: SavedSubmission }
 
 interface Session {
-  engine: EngineClient;
-  info: DatasetInfo;
+  engine?: EngineClient;
+  info?: DatasetInfo;
+  archive?: ArchiveSession;
+  activeFile?: number;
+  training?: TrainingRun;
   directory: string;
   touched: number;
   busy: number;
@@ -19,6 +26,14 @@ export class Sessions {
   constructor(private config: Config) {}
 
   async replace(key: string, source: DatasetSource, directory: string): Promise<DatasetInfo> {
+    return (await this.install(key, source, directory))!;
+  }
+
+  async replaceArchive(key: string, archive: Archive, directory: string): Promise<void> {
+    await this.install(key, archive, directory);
+  }
+
+  private async install(key: string, source: DatasetSource | Archive, directory: string): Promise<DatasetInfo | undefined> {
     let engine: EngineClient | undefined;
     let reserved = false;
     try {
@@ -29,12 +44,16 @@ export class Sessions {
       }
       this.loading.add(key);
       reserved = true;
-      engine = new EngineClient(source, this.config, directory);
-      const info = await engine.request<DatasetInfo>('load');
+      let info: DatasetInfo | undefined;
+      const archive = source.kind === 'archive' ? { source } : undefined;
+      if (source.kind !== 'archive') {
+        engine = new EngineClient(source, this.config, directory);
+        info = await engine.request<DatasetInfo>('load');
+      }
       const previous = this.entries.get(key);
-      this.entries.set(key, { engine, info, directory, touched: Date.now(), busy: 0 });
+      this.entries.set(key, { engine, info, archive, directory, touched: Date.now(), busy: 0 });
       if (requestLogContext.getStore()) {
-        logEvent('dataset_activated', { file_name: info.name, previous_file_name: previous?.info.name, tables: info.schema.models.length });
+        logEvent('dataset_activated', { file_name: source.name, previous_file_name: previous?.archive?.source.name ?? previous?.info?.name, tables: info?.schema.models.length, archive_files: archive?.source.files.length });
       }
       if (previous) await this.destroy(previous).catch(() => console.error('旧数据清理失败。'));
       return info;
@@ -45,31 +64,95 @@ export class Sessions {
     } finally { if (reserved) this.loading.delete(key); }
   }
 
-  async info(key: string): Promise<DatasetInfo> { return (await this.get(key)).info; }
+  async info(key: string): Promise<DatasetInfo> {
+    const session = await this.get(key);
+    if (!session.info || session.engine?.closed) throw new UserError('请先用 /选文件 1 选择压缩包中的数据文件。', 'ZIP_SELECT', 'source');
+    return session.info;
+  }
+
+  archive(key: string): { source: Archive; selected?: number } | undefined {
+    const session = this.entries.get(key);
+    if (session?.archive && (session.busy || Date.now() - session.touched < this.config.sessionTtlMs)) {
+      return { source: session.archive.source, selected: session.engine?.closed ? undefined : session.activeFile };
+    }
+  }
+
+  recordTraining(key: string, run: TrainingRun): void {
+    const session = this.entries.get(key);
+    if (session) {
+      session.training = run;
+      session.touched = Date.now();
+    }
+  }
+
+  latestTraining(key: string): TrainingRun | undefined {
+    const session = this.entries.get(key);
+    if (session && (session.busy || Date.now() - session.touched < this.config.sessionTtlMs)) {
+      session.touched = Date.now();
+      return session.training;
+    }
+  }
+
+  async useArchive<T>(key: string, work: (archive: ArchiveSession) => Promise<T>): Promise<T> {
+    const session = await this.get(key);
+    if (!session.archive) throw new UserError('请先上传包含训练集、测试集和提交模板的 ZIP。', 'ZIP_REQUIRED');
+    session.busy++;
+    try { return await work(session.archive); }
+    finally { session.busy--; session.touched = Date.now(); }
+  }
+
+  async selectArchiveFile(key: string, index: number): Promise<DatasetInfo> {
+    const session = await this.get(key);
+    const file = session.archive?.source.files[index];
+    if (!file) throw new UserError('找不到该文件编号，发送 /状态 查看压缩包文件列表。', 'ZIP_SELECT');
+    if (session.activeFile === index && session.engine && !session.engine.closed && session.info) return session.info;
+    const engine = new EngineClient({ kind: 'file', path: file.path, name: file.name }, this.config, session.directory);
+    session.busy++;
+    try {
+      const info = await engine.request<DatasetInfo>('load');
+      const previous = session.engine;
+      session.engine = engine;
+      session.info = info;
+      session.activeFile = index;
+      await previous?.close();
+      return info;
+    } catch (error) {
+      if (session.engine !== engine) await engine.close();
+      throw error;
+    } finally { session.busy--; session.touched = Date.now(); }
+  }
 
   async run<T>(key: string, command: string, payload?: unknown): Promise<T> {
     const session = await this.get(key);
+    const engine = session.engine;
+    if (!engine) throw new UserError('请先用 /选文件 1 选择压缩包中的数据文件。', 'ZIP_SELECT', 'source');
     session.busy++;
     try {
       if (command === 'analyze') {
         const options = payload as { query: string; inlineCharts: boolean };
-        return await session.engine.analyze(options.query, { inlineCharts: options.inlineCharts }) as T;
+        return await engine.analyze(options.query, { inlineCharts: options.inlineCharts }) as T;
       }
-      return await session.engine.request<T>(command, payload);
+      return await engine.request<T>(command, payload);
     }
     finally {
       session.busy--;
       session.touched = Date.now();
-      if (session.engine.closed && this.entries.get(key) === session) {
-        this.entries.delete(key);
-        await this.destroy(session);
+      if (engine.closed && this.entries.get(key) === session) {
+        if (session.archive) {
+          session.engine = undefined;
+          session.info = undefined;
+          session.activeFile = undefined;
+          await engine.close();
+        } else {
+          await this.clear(key);
+        }
       }
     }
   }
 
   private async get(key: string): Promise<Session> {
     const session = this.entries.get(key);
-    if (session && !session.engine.closed && (session.busy || Date.now() - session.touched < this.config.sessionTtlMs)) {
+    if (session && (session.archive || !session.engine?.closed) && (session.busy || Date.now() - session.touched < this.config.sessionTtlMs)) {
       session.touched = Date.now();
       return session;
     }
@@ -84,13 +167,13 @@ export class Sessions {
   }
 
   private async destroy(session: Session): Promise<void> {
-    await session.engine.close();
+    await session.engine?.close();
     await rm(session.directory, { recursive: true, force: true });
   }
 
   async sweep(): Promise<void> {
     for (const [key, session] of this.entries) {
-      if (!session.busy && (session.engine.closed || Date.now() - session.touched >= this.config.sessionTtlMs)) await this.clear(key);
+      if (!session.busy && ((!session.archive && session.engine?.closed) || Date.now() - session.touched >= this.config.sessionTtlMs)) await this.clear(key);
     }
   }
 
