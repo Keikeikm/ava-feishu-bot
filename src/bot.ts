@@ -10,8 +10,9 @@ import { JobQueue } from './queue.js';
 import { Deduplicator, normalizeMessage } from './messages.js';
 import { bitableRequest, fileExtension } from './sources.js';
 import { UserError, publicFailure } from './errors.js';
-import { datasetCard, fieldsCard, helpCard, previewCard, profileCard, resultCard, resultCsv } from './cards.js';
-import { elapsedMs, logEvent, requestLogContext } from './logging.js';
+import { datasetCard, fieldsCard, helpCard, previewCard, profileCard, resultCard, resultCsv, trainingCard } from './cards.js';
+import { elapsedMs, inputLogFields, logEvent, requestLogContext } from './logging.js';
+import { isTrainingRequest, resolveTrainingRequest, trainClassifier, type TrainingInput } from './training.js';
 
 export class Bot {
   private seen = new Deduplicator();
@@ -28,9 +29,14 @@ export class Bot {
     };
     requestLogContext.run(context, () => {
       const queuedAt = performance.now();
+      const metadata = { chat_type: event.message.chat_type, message_type: event.message.message_type, file_name: message.file?.name };
+      logEvent('message_received', {
+        ...metadata,
+        attachment_count: message.attachmentCount ?? Number(!!message.file),
+        ...inputLogFields(message.text, this.config.logUserInput, [this.config.appSecret, this.config.llm.apiKey]),
+      });
       // A queued job can start while a different request's async context is active.
       const accepted = this.queue.enqueue(message.sessionKey, () => requestLogContext.run(context, () => this.handle(message, queuedAt)));
-      const metadata = { chat_type: event.message.chat_type, message_type: event.message.message_type, file_name: message.file?.name };
       if (accepted) logEvent('message_queued', metadata);
       else {
         logEvent('queue_full', metadata, 'warn');
@@ -74,6 +80,25 @@ export class Bot {
         if (!bitable.question) { await this.messenger.card(message, datasetCard(info)); return; }
       }
       const text = bitable?.question ?? message.text ?? '';
+      if (isTrainingRequest(text)) {
+        const info = await this.sessions.info(message.sessionKey);
+        const training = resolveTrainingRequest(text, info);
+        const dataset = { file_name: info.name, table: training.table, target: training.target };
+        const prepStartedAt = performance.now();
+        logEvent('training_data_requested', dataset);
+        const input = await this.sessions.run<TrainingInput>(message.sessionKey, 'training-data', { training });
+        logEvent('training_data_ready', { rows: input.rows.length, features: input.columns.length, excluded_features: input.excluded.length, duration_ms: elapsedMs(prepStartedAt) });
+        await this.messenger.text(message, '正在训练分类模型并做交叉验证，请稍候。');
+        const trainingStartedAt = performance.now();
+        logEvent('training_started', { ...dataset, runtime: 'local_python', models: ['majority', 'logistic', 'forest'] });
+        const report = await trainClassifier(input, Math.min(this.config.jobTimeoutMs, 120_000), this.config.mlPython);
+        logEvent('training_finished', {
+          model: report.selected, rows: report.rows, missing_labels: report.missingLabels, features: report.features,
+          folds: report.folds, grouped: report.grouped, scores: report.scores, duration_ms: elapsedMs(trainingStartedAt),
+        });
+        await this.messenger.card(message, trainingCard(input, report, this.config.enableCharts));
+        return;
+      }
       if (/^(\/?帮助|\/?help|你好|您好|hello|hi|嗨|在吗)[!！?？。\s]*$/i.test(text)) { await this.messenger.card(message, helpCard()); return; }
       if (/^\/?清空$/.test(text)) {
         await this.sessions.clear(message.sessionKey);

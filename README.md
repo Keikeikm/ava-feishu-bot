@@ -105,6 +105,21 @@ https://你的企业.feishu.cn/base/你的AppToken
 
 每张子表由 AVA 原生 `feishu-bitable` 读取器加载。多表快照使用 AVA 的 SQLite 数据源，首次使用需要下载 DuckDB 官方 SQLite 扩展。机器人需要能读取参与分析的各张表。请复制原表地址，发布分享链接（`/share/base/`）需换成原表地址。表格变化后可重新发送链接刷新快照。普通飞书电子表格可导出为 XLSX/CSV 后发送。
 
+## 训练分类模型
+
+本地运行机器人时，先用 Python 3.11 或以上安装训练依赖。Docker 镜像已包含训练环境。
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r ml/requirements.txt
+```
+
+向机器人发送 CSV、Excel 或多维表格链接，然后用 `/训练 目标列`，也可在同一条消息里写「用这张表预测是否流失，试试随机森林」。目标名称应与列名一致。多个数据表有同名目标列时，使用 `/训练 "是否流失" --表 "客户"` 指定表。训练只使用一张表。
+
+机器人用 AVA 读取当前数据快照，在本地 Python 进程中比较多数类基线、逻辑回归和随机森林。结果卡显示分层交叉验证的宏平均 F1、平衡准确率、准确率，以及各类别的误判数量。每折独立完成缺失值填补和类别编码，相同特征的记录留在同一折。训练任务最多使用 5,000 行、80 个特征和 4 MB 数据。分类目标需有 2～8 个类别，至少 30 条有标签记录，每类至少 5 条。训练依赖可以通过 `ML_PYTHON` 指定其他 Python 路径。
+
+项目中的 `examples/titanic.csv` 可用 `/训练 Survived` 验证标签检查。它的标签与 Kaggle 按性别生成的示例预测一致，机器人会提示核对标签并停止训练。评估历史生还预测需要有可验证标签的训练集。
+
 ## 对话用法
 
 ```text
@@ -178,7 +193,12 @@ npm test
 
 当前已通过 13 项自动测试，包含「文字 + 附件」直接分析、真实 HTTP 文件流经飞书 SDK 下载后由 AVA 读取、文件权限错误识别，并额外使用实际 XLSX 双工作表、Parquet 和 SQLite 文件验证读取与汇总。TypeScript 构建、CLI 帮助入口及 Compose 配置校验通过。本机 Docker daemon 未运行，尚未执行镜像构建或容器启动。
 
-运行 `npm start` 后，在同一终端查看日志。用 `request_id` 追踪一条消息，用 `session_id` 串起同一聊天中同一用户的多次请求。`dataset_activated` 记录新旧文件名，`analysis_started` 记录当前使用的文件和参与追问的历史轮数。`ava_stage_started` 和 `ava_stage_finished` 分别记录 AVA 每个阶段的开始和结束，包括读取数据、生成 SQL、执行查询和生成结论。`reply_sent` 记录飞书回复成功，`job_failed` 带有失败阶段和错误码。日志只记录文件名、阶段、计数、耗时及脱敏后的错误诊断等过程信息。
+运行 `npm start` 后，在同一终端查看日志。用 `request_id` 追踪一条消息，用 `session_id` 串起同一聊天中同一用户的多次请求。
+
+- `message_received` 记录收到的消息文字、附件数量和文件名。正文最多显示 1000 字符，链接、已配置的密钥和常见凭证会遮盖。可用 `LOG_USER_INPUT=false` 关闭正文。
+- `dataset_activated` 记录新旧文件名。`analysis_started` 和 `analysis_finished` 记录使用的数据、历史轮数、返回行数、图表数和耗时。`ava_stage_started` 和 `ava_stage_finished` 记录读取、查询和生成结论等阶段。
+- `training_data_requested` 记录选择的数据表和目标列。`training_data_ready` 记录准备耗时、行数和特征数。`training_finished` 记录验证折数、模型评分和训练耗时。
+- `reply_sent` 记录飞书回复成功，`job_failed` 记录失败阶段和错误码。
 
 ## 代码入口
 

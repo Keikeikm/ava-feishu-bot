@@ -14,6 +14,16 @@ import type { MessageEvent } from '../src/types.js';
 import { analysisPrompt } from '../src/analysis-prompt.js';
 import { resultCard } from '../src/cards.js';
 import type { DatasetInfo } from '../src/types.js';
+import { inputLogFields } from '../src/logging.js';
+
+test('输入日志隐藏链接和凭证，可关闭正文并截断长消息', () => {
+  const input = '分析一下 https://demo.feishu.cn/base/private?table=tbl123\nBearer token123 secret-value sk-abcdefgh12345678';
+  assert.equal(inputLogFields(input, true, ['secret-value']).input_text, '分析一下 [链接已隐藏]\nBearer [已隐藏] [已隐藏] [已隐藏]');
+  assert.deepEqual(inputLogFields(input, false, []), { input_chars: input.length });
+  assert.deepEqual(inputLogFields('字'.repeat(1001), true, []), {
+    input_text: '字'.repeat(1000), input_chars: 1001, input_truncated: true,
+  });
+});
 
 test('宽泛分析主动生成聚合分析目标，结论卡不展示明细、SQL 或附件清单', () => {
   const info = { profile: { models: [] } } as unknown as DatasetInfo;

@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { copyFile, mkdtemp, readFile, rm, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -30,6 +32,69 @@ const overview = `
 function event(id: string, text: string, user = 'ou_user'): MessageEvent {
   return { sender: { sender_type: 'user', sender_id: { open_id: user } }, message: { message_id: id, chat_id: 'oc_chat', chat_type: 'p2p', message_type: 'text', content: JSON.stringify({ text }) } };
 }
+
+test('飞书训练指令读取当前 AVA 数据并生成评估卡，拦截泰坦尼克号示例标签', { timeout: 60_000 }, async t => {
+  const python = process.env.ML_PYTHON || (existsSync('.venv/bin/python') ? resolve('.venv/bin/python') : 'python3');
+  if (spawnSync(python, ['-c', "import importlib.util; raise SystemExit(importlib.util.find_spec('sklearn') is None)"], { stdio: 'ignore' }).status !== 0) {
+    t.skip('需要安装 ml/requirements.txt');
+    return;
+  }
+  const config = loadConfig({ FEISHU_APP_ID: 'test', FEISHU_APP_SECRET: 'test', LLM_API_KEY: 'test', LLM_MODEL: 'test', ML_PYTHON: python });
+  const logs: { event: string; request_id: string; input_text?: string; target?: string; runtime?: string; scores?: unknown[] }[] = [];
+  t.mock.method(console, 'info', (entry: string) => {
+    if (typeof entry === 'string' && entry.startsWith('{')) logs.push(JSON.parse(entry));
+  });
+  const runtime = await mkdtemp(join(tmpdir(), 'ava-ml-e2e-'));
+  const sent: { id: string; kind: 'text' | 'card'; content: string }[] = [];
+  const fixture = ['客户编号,使用量,渠道,流失'];
+  for (let i = 0; i < 160; i++) {
+    const usage = i % 80;
+    const channel = i < 80 ? '线上' : '线下';
+    const label = i % 17 === 0 ? '' : Number(usage < (channel === '线上' ? 32 : 48));
+    fixture.push(`${i},${usage},${channel},${label}`);
+  }
+  const messenger: Messenger = {
+    text: async (m, content) => { sent.push({ id: m.id, kind: 'text', content }); },
+    card: async (m, content) => { sent.push({ id: m.id, kind: 'card', content: JSON.stringify(content) }); },
+    file: async () => { assert.fail('训练结果应直接在卡片里显示'); },
+    download: async (m, path) => {
+      if (m.file?.name === 'titanic.csv') await copyFile(resolve('examples/titanic.csv'), path);
+      else await writeFile(path, fixture.join('\n'));
+    },
+  };
+  const bot = new Bot(config, runtime, messenger, new Sessions(config));
+  try {
+    const upload = (id: string, filename: string, question: string) => {
+      const message = event(id, '');
+      message.message.message_type = 'post';
+      message.message.content = JSON.stringify({
+        content: [[{ tag: 'text', text: question }]],
+        files: [{ file_key: 'file_fixture', file_name: filename }],
+      });
+      bot.accept(message);
+    };
+    upload('train', 'customers.csv', '用这张表预测流失，试试随机森林');
+    upload('unverified', 'titanic.csv', '/训练 Survived');
+    await bot.close();
+    const trained = sent.find(item => item.id === 'train' && item.kind === 'card');
+    assert.ok(trained, JSON.stringify(sent));
+    assert.match(trained.content, /随机森林.*平衡准确率/);
+    assert.match(trained.content, /排除了 10 条缺少目标标签/);
+    assert.match(trained.content, /跳过字段：客户编号/);
+    const chart = JSON.parse(trained.content).body.elements.find((element: { tag: string }) => element.tag === 'chart');
+    assert.equal(chart.chart_spec.data.values.length, 2);
+    const received = logs.find(log => log.event === 'message_received' && log.input_text === '用这张表预测流失，试试随机森林');
+    assert.ok(received);
+    const trainingLogs = logs.filter(log => log.request_id === received.request_id);
+    assert.ok(trainingLogs.some(log => log.event === 'training_started' && log.target === '流失' && log.runtime === 'local_python'));
+    assert.equal(trainingLogs.find(log => log.event === 'training_finished')?.scores?.length, 3);
+    assert.ok(sent.some(item => item.id === 'unverified' && item.content.includes('ML_UNVERIFIED_LABEL')));
+    assert.ok(!sent.some(item => item.id === 'unverified' && item.kind === 'card'));
+  } finally {
+    await bot.close();
+    await rm(runtime, { recursive: true, force: true });
+  }
+});
 
 test('真实 AVA + 受控模型接口：文件上传、SQL计算、追问、图表、去重及不同用户隔离', { timeout: 60_000 }, async () => {
   const prompts: string[] = [];

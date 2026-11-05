@@ -7,6 +7,7 @@ import { chartConclusion, inlineCharts } from './charts.js';
 import { bitableReadError, publicFailure, UserError, type FailureStage } from './errors.js';
 import { elapsedMs, logEvent, requestLogContext, type RequestLogContext } from './logging.js';
 import type { AnalysisOutput, DatasetInfo, DatasetSource } from './types.js';
+import { trainingSnapshot, type TrainingRequest } from './training.js';
 
 const settings = workerData as { source: DatasetSource; directory?: string; llm: LLMConfig; maxResultRows: number };
 const ava = new AVA({
@@ -45,7 +46,12 @@ const stages = {
 };
 for (const [event, stage] of Object.entries(stages)) {
   let startedAt = 0;
-  const stageName = () => event === 'query' && currentStage === 'preview' ? 'preview' : stage;
+  const stageName = () => {
+    if (event !== 'query') return stage;
+    if (currentStage === 'preview') return 'preview';
+    if (currentStage === 'training') return 'training_data';
+    return stage;
+  };
   ava.on(`${event}start`, (detail: { data?: { attempt?: number } | null }) => {
     if (!requestLogContext.getStore()) return;
     startedAt = performance.now();
@@ -70,7 +76,7 @@ for (const [event, stage] of Object.entries(stages)) {
   });
 }
 
-type WorkerPayload = { query?: string; inlineCharts?: boolean };
+type WorkerPayload = { query?: string; inlineCharts?: boolean; training?: TrainingRequest };
 
 async function execute(command: string, payload: WorkerPayload = {}): Promise<unknown> {
   if (command === 'load') {
@@ -104,6 +110,10 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
   if (command === 'dispose') { await ava.dispose(); return null; }
   if (!info) throw new UserError('请先上传表格。');
   if (command === 'info') return info;
+  if (command === 'training-data' && payload.training) {
+    currentStage = 'training';
+    return trainingSnapshot(ava, info, payload.training);
+  }
   if (command === 'export') {
     if (!lastResult) throw new UserError('请先完成一次分析，再导出结果。', 'NO_ANALYSIS');
     return { result: lastResult, visualization: null } satisfies AnalysisOutput;
@@ -115,8 +125,9 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
   if (query.length > 6000) throw new UserError('问题最多支持 6000 个字符，请精简后重试。');
   const context = history.length ? `\n以下是同一份数据的历史问题与查询，用于理解本次追问。每次都需要重新执行查询。\n${JSON.stringify(history)}\n` : '';
   currentStage = 'analysis';
+  const startedAt = performance.now();
   if (requestLogContext.getStore()) {
-    logEvent('analysis_started', { file_name: info.name, history_turns: history.length });
+    logEvent('analysis_started', { file_name: info.name, tables: info.schema.models.length, history_turns: history.length, charts_requested: !!payload.inlineCharts });
   }
   const options = {
     maxRows: settings.maxResultRows, maxResultBytes: 512 * 1024, strategy: { type: 'direct', maxRetries: 2 },
@@ -145,6 +156,9 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
   if (payload.inlineCharts) {
     output.charts = inlineCharts(result);
     if (requestLogContext.getStore()) logEvent('analysis_charts_prepared', { chart_count: output.charts.length });
+  }
+  if (requestLogContext.getStore()) {
+    logEvent('analysis_finished', { returned_rows: result.data.length, truncated: !!result.truncated, chart_count: output.charts?.length ?? 0, duration_ms: elapsedMs(startedAt) });
   }
   return output;
 }

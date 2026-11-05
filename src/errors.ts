@@ -1,4 +1,4 @@
-export type FailureStage = 'download' | 'source' | 'schema' | 'profile' | 'preview' | 'analysis' | 'visualization' | 'suggest';
+export type FailureStage = 'download' | 'source' | 'schema' | 'profile' | 'preview' | 'analysis' | 'visualization' | 'suggest' | 'training';
 export interface Failure {
   code: string;
   message: string;
@@ -88,7 +88,7 @@ export function publicFailure(error: unknown, stage?: FailureStage): Failure {
     diagnostic.reason = 'MEMORY_LIMIT';
     return failure('MEMORY_LIMIT', '数据处理超过引擎内存限制，请缩小文件或拆分工作表后重试。');
   }
-  const labels: Partial<Record<FailureStage, string>> = { source: '读取文件', schema: '读取字段', profile: '统计行数与空值', preview: '生成数据预览', analysis: '执行分析', visualization: '生成图表', suggest: '生成建议' };
+  const labels: Partial<Record<FailureStage, string>> = { source: '读取文件', schema: '读取字段', profile: '统计行数与空值', preview: '生成数据预览', analysis: '执行分析', visualization: '生成图表', suggest: '生成建议', training: '准备训练数据' };
   const label = stage && labels[stage];
   return failure('ENGINE_ERROR', label ? `数据引擎在「${label}」阶段失败，请查看终端诊断日志后重试。` : '数据加载或分析失败，请检查文件格式、字段名和模型配置后重试。');
 }

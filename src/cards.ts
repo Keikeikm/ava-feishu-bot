@@ -1,6 +1,7 @@
 import type { AnalysisOutput, DatasetInfo } from './types.js';
 import { SUPPORTED_FILES } from './sources.js';
 import { feishuChart } from './charts.js';
+import type { TrainingInput, TrainingReport } from './training.js';
 
 export type Card = ReturnType<typeof card> | { schema: '2.0'; header: ReturnType<typeof card>['header']; body: { elements: (ReturnType<typeof plain> | ReturnType<typeof feishuChart>)[] } };
 const plain = (text: string) => ({ tag: 'div', text: { tag: 'plain_text', content: text.slice(0, 4000) } });
@@ -31,7 +32,7 @@ export function helpCard(): Card {
   return card('AVA 数据分析助手', [
     plain(`发送表格和分析要求，我会给出结论、依据和相关图表。也可以只上传表格，再选择分析方向。\n支持：${SUPPORTED_FILES}\n也可发送 /导入 加上飞书多维表格链接。`),
     plain('例如：\n分析一下，看看哪些变化值得关注\n按地区汇总销售额，并画柱状图\n接着只看华东，按月份比较\n/分析 不画图 统计各地区销售额'),
-    plain('/建议：看看接下来可以分析什么\n/状态：查看当前使用的文件\n/清空：删除自己的数据和追问记录'),
+    plain('/训练 目标列：训练分类模型并查看评估\n/建议：看看接下来可以分析什么\n/状态：查看当前使用的文件\n/清空：删除自己的数据和追问记录'),
     plain('群聊中请 @ 机器人提问；数据按「会话 + 发送者」隔离。新文件加载成功后替换旧文件。多表 Excel 可在问题中指定工作表名。'),
   ]);
 }
@@ -71,6 +72,44 @@ export function resultCard(output: AnalysisOutput): Card {
     schema: '2.0',
     header: { template: 'green', title: { tag: 'plain_text', content: '分析结论' } },
     body: { elements: [...elements, ...caveat] },
+  };
+}
+
+export function trainingCard(input: TrainingInput, report: TrainingReport, withChart: boolean): Card {
+  const names = { majority: '多数类基线', logistic: '逻辑回归', forest: '随机森林' };
+  const pct = (n: number) => `${(100 * n).toFixed(1)}%`;
+  const best = report.scores.find(score => score.model === report.selected)!;
+  const baseline = report.scores.find(score => score.model === 'majority')!;
+  const difference = (best.macroF1 - baseline.macroF1) * 100;
+  const validation = difference > 0 ? `比多数类基线高 ${difference.toFixed(1)} 个百分点` : '未超过多数类基线';
+  const groups = report.confusion.map((row, i) => ({
+    label: value(report.labels[i], 40),
+    total: row.reduce((sum, count) => sum + count, 0),
+    errors: row.reduce((sum, count, j) => sum + (i === j ? 0 : count), 0),
+  }));
+  const elements = [
+    plain(`${value(input.dataset, 100)} / ${value(input.table, 80)} · 预测「${value(input.target, 80)}」\n${names[report.selected]}的宏平均 F1 为 ${pct(best.macroF1)}，${validation}。`),
+    plain(report.scores.map(s => `${names[s.model]} · 宏平均 F1 ${pct(s.macroF1)} · 平衡准确率 ${pct(s.balancedAccuracy)} · 准确率 ${pct(s.accuracy)}`).join('\n')),
+    plain(`验证误判（${names[report.selected]}）\n${groups.map(group => `${group.label}：${group.errors} / ${group.total} 条`).join('\n')}`),
+  ];
+  const notes = [
+    `使用 ${report.rows} 条有标签记录、${report.features} 个特征，进行 ${report.folds} 折分层交叉验证。`,
+    report.missingLabels ? `排除了 ${report.missingLabels} 条缺少目标标签的记录。` : '',
+    report.grouped ? '相同特征的记录留在同一折。' : '',
+    input.excluded.length ? `跳过字段：${input.excluded.slice(0, 6).map(name => value(name, 30)).join('、')}${input.excluded.length > 6 ? '等' : ''}。` : '',
+    '指标来自这份数据的交叉验证。用于未来数据前，需要另做验证并确认特征在预测时可取得。',
+  ].filter(Boolean).join('\n');
+  const note = plain(notes);
+  const title = '分类模型评估';
+  if (!withChart) return card(title, [...elements, note], 'green');
+  const chart = feishuChart({
+    kind: 'bar', title: '按真实类别分组的误判条数', limited: false,
+    points: groups.map((group, i) => ({ label: `${i + 1}. ${group.label}`, value: group.errors })),
+  });
+  return {
+    schema: '2.0',
+    header: { template: 'green', title: { tag: 'plain_text', content: title } },
+    body: { elements: [...elements, chart, note] },
   };
 }
 

@@ -14,6 +14,8 @@ export interface Config {
   jobTimeoutMs: number;
   maxResultRows: number;
   enableCharts: boolean;
+  logUserInput: boolean;
+  mlPython?: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, requireFeishu = true): Config {
@@ -30,6 +32,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, requireFeishu =
   const baseURL = env.LLM_BASE_URL?.trim();
   if (baseURL && !/^https?:\/\//.test(baseURL)) throw new Error('LLM_BASE_URL 必须是 http(s) API 地址。');
   if (env.ENABLE_CHARTS && !['true', 'false'].includes(env.ENABLE_CHARTS)) throw new Error('ENABLE_CHARTS 只能填写 true 或 false。');
+  if (env.LOG_USER_INPUT && !['true', 'false'].includes(env.LOG_USER_INPUT)) throw new Error('LOG_USER_INPUT 只能填写 true 或 false。');
   return {
     appId: requireFeishu ? required('FEISHU_APP_ID') : env.FEISHU_APP_ID || '',
     appSecret: requireFeishu ? required('FEISHU_APP_SECRET') : env.FEISHU_APP_SECRET || '',
@@ -43,5 +46,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, requireFeishu =
     jobTimeoutMs: integer('JOB_TIMEOUT_SECONDS', 180, 10, 600) * 1000,
     maxResultRows: integer('MAX_RESULT_ROWS', 500, 1, 10_000),
     enableCharts: env.ENABLE_CHARTS !== 'false',
+    logUserInput: env.LOG_USER_INPUT !== 'false',
+    mlPython: env.ML_PYTHON?.trim() || undefined,
   };
 }
