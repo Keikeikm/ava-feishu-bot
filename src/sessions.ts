@@ -29,7 +29,7 @@ export class Sessions {
       }
       this.loading.add(key);
       reserved = true;
-      engine = new EngineClient(source, this.config);
+      engine = new EngineClient(source, this.config, directory);
       const info = await engine.request<DatasetInfo>('load');
       const previous = this.entries.get(key);
       this.entries.set(key, { engine, info, directory, touched: Date.now(), busy: 0 });

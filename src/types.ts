@@ -10,6 +10,7 @@ export interface DatasetInfo {
   schema: Schema;
   profile: Profile;
   previews: { table: string; rows: Record<string, unknown>[] }[];
+  labelCaveat?: string;
 }
 
 export interface AnalysisOutput {

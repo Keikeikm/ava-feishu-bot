@@ -15,6 +15,7 @@ export class UserError extends Error {
 
 // AVA's Feishu loader reports the API's numeric code in its error message.
 export function bitableReadError(error: unknown): UserError {
+  if (error instanceof UserError) return error;
   const message = error instanceof Error ? error.message : '';
   const match = /^Feishu Error (\d+):/.exec(message);
   const feishuCode = match ? Number(match[1]) : undefined;
@@ -33,9 +34,6 @@ export function bitableReadError(error: unknown): UserError {
   if (feishuCode === 91402 || feishuCode === 1254040 || feishuCode === 1254041 || feishuCode === 93004) {
     return failure('BITABLE_NOT_FOUND', '飞书未找到机器人可访问的表格或知识库节点。请确认链接指向的资源仍存在，并对当前机器人应用开放。');
   }
-  if (/^Feishu Bitable \S+ has \d+ tables\. Add \?table=/.test(message)) {
-    return failure('BITABLE_TABLE_REQUIRED', '这个多维表格包含多张数据表。请打开要分析的那一张，复制带有 table=tbl… 的链接后再发送。');
-  }
   if (/^Feishu wiki node .* hosts a .* not a Bitable/.test(message)) {
     return failure('BITABLE_WIKI_TYPE', '这个知识库链接指向其他类型的文档。请发送多维表格所在的知识库页面或表格地址。');
   }
@@ -43,7 +41,10 @@ export function bitableReadError(error: unknown): UserError {
     return failure('BITABLE_NO_FIELDS', '没有读取到可分析的字段。请检查该数据表的字段类型，以及机器人是否能读取这些字段。');
   }
   if (/^Feishu Bitable \S+ has no tables\.$/.test(message)) {
-    return failure('BITABLE_NO_TABLES', '飞书没有返回机器人可读取的数据表。请打开目标子表，复制带有 table=tbl… 的链接，并检查机器人对该子表的访问权限。');
+    return failure('BITABLE_NO_TABLES', '飞书没有返回机器人可读取的数据表。请检查机器人对该多维表格的访问权限。');
+  }
+  if (/INSTALL sqlite|extension.*sqlite|sqlite.*extension/i.test(message)) {
+    return failure('EXTENSION', '加载多张数据表需要 DuckDB 的 SQLite 扩展。请检查服务端网络后重试。');
   }
   return failure('BITABLE_READ_FAILED', feishuCode
     ? `飞书读表接口返回错误（飞书错误码 ${feishuCode}）。请将错误码提供给管理员排查。`

@@ -18,9 +18,9 @@ export class EngineClient {
   closed = false;
   private closing?: Promise<void>;
 
-  constructor(source: DatasetSource, private config: Pick<Config, 'llm' | 'maxResultRows' | 'jobTimeoutMs'>) {
+  constructor(source: DatasetSource, private config: Pick<Config, 'llm' | 'maxResultRows' | 'jobTimeoutMs'>, directory?: string) {
     this.worker = new Worker(new URL('./analysis-worker.js', import.meta.url), {
-      workerData: { source, llm: config.llm, maxResultRows: config.maxResultRows },
+      workerData: { source, directory, llm: config.llm, maxResultRows: config.maxResultRows },
       resourceLimits: { maxOldGenerationSizeMb: 256 },
     });
     this.worker.on('message', (reply: { id: number; ok: boolean; value: unknown; error?: Failure }) => {

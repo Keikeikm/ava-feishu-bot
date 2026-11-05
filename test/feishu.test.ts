@@ -16,6 +16,7 @@ import { EngineClient } from '../src/engine.js';
 import type { DatasetInfo } from '../src/types.js';
 import { bitableReadError, publicFailure } from '../src/errors.js';
 import { avaSource } from '../src/sources.js';
+import { loadBitable } from '../src/bitable.js';
 
 test('AVA 读飞书多维表格：区分 API 权限和文档权限，授权后读出记录', async t => {
   let deniedCode = 99991672;
@@ -46,6 +47,46 @@ test('AVA 读飞书多维表格：区分 API 权限和文档权限，授权后�
     assert.deepEqual(result.data, [{ 类别: '茶', 合计: 20 }]);
   } finally {
     await ava.dispose();
+  }
+});
+
+test('整份飞书 Base 枚举所有子表，复用 AVA 读取并支持跨表聚合', async t => {
+  const readTables: string[] = [];
+  const success = (data: object) => Response.json({ code: 0, data });
+  t.mock.method(globalThis, 'fetch', async (input: string) => {
+    const { pathname, searchParams } = new URL(input);
+    if (pathname.endsWith('/tenant_access_token/internal')) return Response.json({ code: 0, tenant_access_token: 'fake-token' });
+    if (pathname.endsWith('/spaces/get_node')) return success({ node: { obj_type: 'bitable', obj_token: 'bascnFixture' } });
+    if (pathname.endsWith('/apps/bascnFixture/tables')) {
+      return searchParams.get('page_token') === 'next'
+        ? success({ items: [{ table_id: 'tblProducts', name: '产品' }] })
+        : success({ items: [{ table_id: 'tblOrders', name: '订单' }], has_more: true, page_token: 'next' });
+    }
+    const [, tableId, resource] = /\/tables\/(tblOrders|tblProducts)\/(fields|records)$/.exec(pathname) ?? [];
+    assert.ok(tableId && resource, pathname);
+    if (resource === 'fields') return success({ items: [
+      { field_name: '产品编号', type: 1 }, tableId === 'tblOrders' ? { field_name: '金额', type: 2 } : { field_name: '类别', type: 3 },
+    ] });
+    readTables.push(tableId);
+    return success({ items: tableId === 'tblOrders'
+      ? [{ fields: { 产品编号: '001', 金额: 8.5 } }, { fields: { 产品编号: '002', 金额: 30 } }]
+      : [{ fields: { 产品编号: '001', 类别: '茶' } }, { fields: { 产品编号: '002', 类别: '咖啡' } }] });
+  });
+  const directory = await mkdtemp(join(tmpdir(), 'ava-bitable-base-'));
+  const ava = new AVA({ engine: { type: 'duckdb' }, llm: { model: 'test' } });
+  const source = { kind: 'bitable' as const, name: '示例 Base', url: 'https://demo.feishu.cn/wiki/Example', appId: 'fake-id', appSecret: 'fake-secret' };
+  try {
+    assert.equal(await loadBitable(ava, source, directory), 2);
+    assert.deepEqual(readTables, ['tblOrders', 'tblProducts']);
+    assert.deepEqual((await ava.schema()).models.map(m => m.name).sort(), ['产品', '订单']);
+    const result = await ava.query('SELECT p."类别", SUM(o."金额") AS "合计" FROM "订单" o JOIN "产品" p USING ("产品编号") GROUP BY 1 ORDER BY 2');
+    assert.deepEqual(result.data, [{ 类别: '茶', 合计: 8.5 }, { 类别: '咖啡', 合计: 30 }]);
+    assert.equal(await loadBitable(ava, { ...source, url: 'https://demo.feishu.cn/base/bascnFixture?table=tblOrders' }), 1);
+    assert.deepEqual((await ava.schema()).models.map(m => m.name), ['data']);
+    assert.deepEqual(readTables, ['tblOrders', 'tblProducts', 'tblOrders']);
+  } finally {
+    await ava.dispose();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

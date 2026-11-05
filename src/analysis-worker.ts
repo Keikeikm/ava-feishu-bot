@@ -1,13 +1,14 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { AVA, type AnalysisResponse, type ExecutionResult, type LLMConfig } from '@antv/ava';
 import { avaSource } from './sources.js';
+import { loadBitable } from './bitable.js';
 import { analysisPrompt } from './analysis-prompt.js';
 import { chartConclusion, inlineCharts } from './charts.js';
 import { bitableReadError, publicFailure, UserError, type FailureStage } from './errors.js';
 import { elapsedMs, logEvent, requestLogContext, type RequestLogContext } from './logging.js';
 import type { AnalysisOutput, DatasetInfo, DatasetSource } from './types.js';
 
-const settings = workerData as { source: DatasetSource; llm: LLMConfig; maxResultRows: number };
+const settings = workerData as { source: DatasetSource; directory?: string; llm: LLMConfig; maxResultRows: number };
 const ava = new AVA({
   llm: settings.llm,
   engine: { type: 'duckdb', memoryLimit: '256MB', threads: 1, maxTempDirectorySize: '256MB', queryTimeoutMs: 30_000 },
@@ -18,6 +19,23 @@ let lastResult: AnalysisResponse | undefined;
 let currentStage: FailureStage | undefined;
 let activeAnalysis: { sql?: string; execution?: ExecutionResult; summaryFailed?: boolean } | undefined;
 const identifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
+
+async function labelCaveat(schema: DatasetInfo['schema'], profile: DatasetInfo['profile']): Promise<string | undefined> {
+  const model = schema.models[0];
+  if (settings.source.kind !== 'file' || schema.models.length !== 1 || model?.name !== 'data'
+      || Number(profile.models[0]?.metrics.row_count) !== 418) return;
+  const columns = new Set(model.columns.map(column => column.name.toLowerCase()));
+  if (!['passengerid', 'survived', 'sex', 'pclass'].every(column => columns.has(column))) return;
+
+  const { data } = await ava.query(`SELECT COUNT(DISTINCT PassengerId) AS ids,
+    MIN(TRY_CAST(PassengerId AS BIGINT)) AS first_id, MAX(TRY_CAST(PassengerId AS BIGINT)) AS last_id,
+    COUNT(*) FILTER (WHERE TRY_CAST(Survived AS DOUBLE) = CASE LOWER(TRIM(CAST(Sex AS VARCHAR))) WHEN 'female' THEN 1 WHEN 'male' THEN 0 END) AS matched
+    FROM data`);
+  const row = data[0];
+  if (Number(row?.ids) === 418 && Number(row?.first_id) === 892 && Number(row?.last_id) === 1309 && Number(row?.matched) === 418) {
+    return '这 418 条记录的 Survived 标签与 Kaggle 按性别生成的示例预测规则完全一致。标签来源待核实，分析只描述文件中的标签分布，不能作为历史生还率或模型效果。';
+  }
+}
 
 // AVA events can carry queries, records and provider errors. Select only process metadata.
 const stages = {
@@ -57,12 +75,15 @@ type WorkerPayload = { query?: string; inlineCharts?: boolean };
 async function execute(command: string, payload: WorkerPayload = {}): Promise<unknown> {
   if (command === 'load') {
     currentStage = 'source';
-    const source = await avaSource(settings.source);
-    try {
-      await ava.source(source);
-    } catch (error) {
-      if (source.type === 'feishu-bitable') throw bitableReadError(error);
-      throw error;
+    if (settings.source.kind === 'bitable') {
+      try {
+        const tables = await loadBitable(ava, settings.source, settings.directory);
+        if (requestLogContext.getStore()) logEvent('bitable_tables_loaded', { tables });
+      } catch (error) {
+        throw bitableReadError(error);
+      }
+    } else {
+      await ava.source(await avaSource(settings.source));
     }
     await ava.semantic({}, () => ({ description: '请用简体中文回答。数值必须基于查询结果，说明统计口径和缺失值。不要编造因果关系。' }));
     currentStage = 'schema';
@@ -77,7 +98,7 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
       const result = await ava.query(`SELECT * FROM ${table} LIMIT 5`, { maxRows: 5, maxResultBytes: 16_384 });
       previews.push({ table: model.name, rows: result.data });
     }
-    info = { name: settings.source.name, schema, profile, previews };
+    info = { name: settings.source.name, schema, profile, previews, labelCaveat: await labelCaveat(schema, profile) };
     return info;
   }
   if (command === 'dispose') { await ava.dispose(); return null; }
@@ -116,6 +137,7 @@ async function execute(command: string, payload: WorkerPayload = {}): Promise<un
     activeAnalysis = undefined;
   }
   result.query = query;
+  if (info.labelCaveat) result.text = `${result.text.trim()}\n【标签口径】${info.labelCaveat}`.trim();
   history.push({ query: query.slice(0, 1000), sql: result.sql?.slice(0, 2000), text: result.text.slice(0, 1000) });
   if (history.length > 4) history.shift();
   lastResult = result;
