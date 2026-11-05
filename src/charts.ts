@@ -87,14 +87,28 @@ export function inlineCharts(result: AnalysisResponse): InlineChart[] {
   return chart ? [chart] : [];
 }
 
+export function feishuChartTitle(chart: InlineChart): string {
+  const yearly = chart.points.every(point => /^[12]\d{3}年?$/.test(point.label));
+  // Only repair the year typo in an explicit time span on a year series.
+  const title = yearly
+    ? chart.title.replace(/(近|最近|过去|未来)(\s*\d+\s*)干(?:[干年]度)?/g, '$1$2年')
+    : chart.title;
+  return chart.limited ? `${title}（部分结果）` : title;
+}
+
+function chartDisplayValue(value: number): number {
+  if (Number.isInteger(value)) return value;
+  return Math.abs(value) < 1 ? Number(value.toPrecision(3)) : Number(value.toFixed(2));
+}
+
 export function feishuChart(chart: InlineChart) {
-  const title = { text: chart.limited ? `${chart.title}（部分结果）` : chart.title };
-  const data = { values: chart.points };
+  // Feishu can label marks with the raw number. Format the chart copy only.
+  const data = { values: chart.points.map(point => ({ ...point, value: chartDisplayValue(point.value) })) };
   const chart_spec = chart.kind === 'pie'
-    ? { type: 'pie', title, data, categoryField: 'label', valueField: 'value', legends: { visible: true } }
+    ? { type: 'pie', data, categoryField: 'label', valueField: 'value', legends: { visible: true } }
     : chart.kind === 'bar'
-      ? { type: 'bar', title, data, direction: 'horizontal', xField: 'value', yField: 'label' }
-      : { type: chart.kind === 'line' ? 'line' : 'bar', title, data, xField: 'label', yField: 'value' };
+      ? { type: 'bar', data, direction: 'horizontal', xField: 'value', yField: 'label' }
+      : { type: chart.kind === 'line' ? 'line' : 'bar', data, xField: 'label', yField: 'value' };
   return { tag: 'chart' as const, aspect_ratio: '16:9', preview: true, chart_spec };
 }
 

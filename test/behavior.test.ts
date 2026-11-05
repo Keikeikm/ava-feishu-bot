@@ -15,6 +15,29 @@ import { analysisPrompt } from '../src/analysis-prompt.js';
 import { resultCard } from '../src/cards.js';
 import type { DatasetInfo } from '../src/types.js';
 import { inputLogFields } from '../src/logging.js';
+import type { InlineChart } from '../src/charts.js';
+
+test('分析卡用普通文字展示标题，图中去掉浮点尾数并保留小量级数值', () => {
+  const forecast: InlineChart = {
+    kind: 'column', title: '未来3干线性回归预测数量（条）', limited: false,
+    points: [{ label: '2022', value: 1422.6000000000058 }, { label: '2023', value: 1538.6000000000058 }],
+  };
+  const smallValues: InlineChart = {
+    kind: 'bar', title: '近10干货类别占比', limited: false,
+    points: [{ label: '商品', value: 0.000021234567 }, { label: '服务', value: 237 }],
+  };
+  const card = resultCard({
+    result: { query: '分析趋势', text: '预测与分布', data: [], schema: [] },
+    visualization: null, charts: [forecast, smallValues],
+  });
+  assert.ok('body' in card);
+  const elements = card.body.elements;
+  assert.deepEqual(elements[1], { tag: 'div', text: { tag: 'plain_text', content: '未来3年线性回归预测数量（条）' } });
+  assert.deepEqual(elements[3], { tag: 'div', text: { tag: 'plain_text', content: '近10干货类别占比' } });
+  const charts = elements.flatMap(element => 'chart_spec' in element ? [element.chart_spec] : []);
+  assert.deepEqual(charts.map(chart => chart.data.values.map(point => point.value)), [[1422.6, 1538.6], [0.0000212, 237]]);
+  assert.equal(forecast.points[0]?.value, 1422.6000000000058);
+});
 
 test('输入日志隐藏链接和凭证，可关闭正文并截断长消息', () => {
   const input = '分析一下 https://demo.feishu.cn/base/private?table=tbl123\nBearer token123 secret-value sk-abcdefgh12345678';

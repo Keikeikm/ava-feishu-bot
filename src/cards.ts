@@ -1,10 +1,11 @@
 import type { AnalysisOutput, DatasetInfo } from './types.js';
 import { SUPPORTED_FILES } from './sources.js';
-import { feishuChart } from './charts.js';
+import { feishuChart, feishuChartTitle, type InlineChart } from './charts.js';
 import type { TrainingInput, TrainingReport } from './training.js';
 
 export type Card = ReturnType<typeof card> | { schema: '2.0'; header: ReturnType<typeof card>['header']; body: { elements: (ReturnType<typeof plain> | ReturnType<typeof feishuChart>)[] } };
 const plain = (text: string) => ({ tag: 'div', text: { tag: 'plain_text', content: text.slice(0, 4000) } });
+const chartElements = (chart: InlineChart) => [plain(feishuChartTitle(chart)), feishuChart(chart)];
 function card(title: string, elements: ReturnType<typeof plain>[], color = 'blue') {
   // Keep large schemas and long answers within Feishu's message payload limit.
   const bounded: ReturnType<typeof plain>[] = [];
@@ -62,7 +63,7 @@ export function profileCard(info: DatasetInfo): Card {
 export function resultCard(output: AnalysisOutput): Card {
   const summary = output.result.text?.trim() || '暂时没有足够的数据得出结论。你最想比较哪个指标或时间段？';
   const caveat = output.result.truncated ? [plain('本次计算结果超出返回上限，可以缩小范围继续核实。')] : [];
-  const charts = output.charts?.map(feishuChart) || [];
+  const charts = output.charts?.flatMap(chartElements) || [];
   if (!charts.length) return card('分析结论', [plain(summary), ...caveat], 'green');
   const next = summary.indexOf('【下一步】');
   const elements = next > 0
@@ -102,14 +103,14 @@ export function trainingCard(input: TrainingInput, report: TrainingReport, withC
   const note = plain(notes);
   const title = '分类模型评估';
   if (!withChart) return card(title, [...elements, note], 'green');
-  const chart = feishuChart({
+  const chart = chartElements({
     kind: 'bar', title: '按真实类别分组的误判条数', limited: false,
     points: groups.map((group, i) => ({ label: `${i + 1}. ${group.label}`, value: group.errors })),
   });
   return {
     schema: '2.0',
     header: { template: 'green', title: { tag: 'plain_text', content: title } },
-    body: { elements: [...elements, chart, note] },
+    body: { elements: [...elements, ...chart, note] },
   };
 }
 
